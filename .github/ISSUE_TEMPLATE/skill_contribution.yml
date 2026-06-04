@@ -1,0 +1,81 @@
+name: Skill Contribution
+description: Propose a new analysis skill or improve an existing one
+title: "[Skill]: "
+labels: ["skill", "enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Skills are YAML-based analysis pipelines that power SmartPerfetto's trace analysis.
+        Use this template to propose new skills or improvements to existing ones.
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Skill Type
+      options:
+        - New atomic skill (single SQL query)
+        - New composite skill (multi-step analysis)
+        - New pipeline skill (render pipeline detection)
+        - Existing skill improvement
+        - Vendor override (.override.yaml)
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What does this skill detect or analyze?
+      placeholder: |
+        This skill detects [specific performance pattern] by querying [data source].
+        It helps identify [root cause category] in [scene type] scenarios.
+    validations:
+      required: true
+
+  - type: textarea
+    id: sql
+    attributes:
+      label: Core SQL Query
+      description: The SQL query (or pseudocode) that powers the skill
+      render: sql
+      placeholder: |
+        SELECT ts, dur, name
+        FROM slice
+        WHERE name LIKE '%pattern%'
+
+  - type: dropdown
+    id: scene
+    attributes:
+      label: Target Scene
+      description: Which analysis scene benefits from this skill?
+      multiple: true
+      options:
+        - Scrolling / Jank
+        - Startup / Launch
+        - ANR
+        - Touch / Interaction
+        - Memory
+        - Game
+        - Pipeline (teaching)
+        - General
+    validations:
+      required: true
+
+  - type: textarea
+    id: stdlib
+    attributes:
+      label: Perfetto Stdlib Modules Used
+      description: List any `INCLUDE PERFETTO MODULE` dependencies
+      placeholder: |
+        android.frames.timeline
+        android.binder
+        linux.cpu.utilization
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: How to validate?
+      description: What trace files or scenarios can be used to test this skill?
+      placeholder: |
+        Test with: scroll-demo-customer-scroll.pftrace
+        Expected: Should detect N jank frames with reason_code = xxx

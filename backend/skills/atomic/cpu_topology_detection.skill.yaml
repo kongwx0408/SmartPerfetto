@@ -1,0 +1,179 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# CPU 拓扑动态检测 (CPU Topology Detection)
+# =============================================================================
+# Public compatibility wrapper around cpu_topology_view.
+#
+# Keep CPU topology inference centralized in `_cpu_topology`; do not maintain
+# another threshold-based classifier here. The shared view:
+# - builds the CPU universe from observed trace evidence first;
+# - ignores stale CPU table rows unless no observed CPU evidence exists;
+# - classifies common Android layouts such as 6+2, 4+3+1, 4+4, 4+2, 4-only,
+#   and 10-core tri-cluster layouts from capacity/frequency scale clusters;
+# - keeps unsupported/insufficient scale evidence explicit as `unknown`.
+# =============================================================================
+
+name: cpu_topology_detection
+version: "1.0"
+type: composite
+category: hardware
+tier: B
+
+meta:
+  display_name: "CPU 拓扑检测"
+  description: "基于共享 _cpu_topology 视图检测 CPU 大小核拓扑"
+  icon: "memory"
+  tags: [cpu, topology, cluster, atomic]
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间（保留兼容；共享拓扑检测使用整条 trace 的观测证据）"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间（保留兼容；共享拓扑检测使用整条 trace 的观测证据）"
+
+steps:
+  - id: init_cpu_topology
+    type: skill
+    name: "初始化 CPU 拓扑"
+    skill: cpu_topology_view
+    display:
+      level: hidden
+    optional: true
+
+  - id: detect_cpu_clusters
+    type: atomic
+    name: "检测 CPU 集群"
+    display:
+      level: summary
+      layer: overview
+      title: "CPU 拓扑检测结果"
+      columns:
+        - name: cpu
+          label: "CPU"
+          type: number
+        - name: cluster_type
+          label: "核心类型"
+          type: string
+        - name: max_freq_mhz
+          label: "Max Freq"
+          type: number
+        - name: capacity
+          label: "Capacity"
+          type: number
+        - name: topology_source
+          label: "判定来源"
+          type: string
+        - name: cluster_rank
+          label: "簇档位"
+          type: number
+        - name: cluster_count
+          label: "簇数量"
+          type: number
+    sql: |
+      SELECT
+        cpu_id as cpu,
+        core_type as cluster_type,
+        CASE WHEN max_freq IS NULL THEN NULL ELSE ROUND(max_freq / 1000.0, 0) END as max_freq_mhz,
+        capacity,
+        topology_source,
+        cluster_rank,
+        cluster_count,
+        CASE core_type
+          WHEN 'prime' THEN '超大核'
+          WHEN 'big' THEN '大核'
+          WHEN 'medium' THEN '中核'
+          WHEN 'little' THEN '小核'
+          ELSE '未知'
+        END as cluster_type_cn
+      FROM _cpu_topology
+      ORDER BY
+        CASE core_type
+          WHEN 'prime' THEN 1
+          WHEN 'big' THEN 2
+          WHEN 'medium' THEN 3
+          WHEN 'little' THEN 4
+          ELSE 5
+        END,
+        cpu_id
+    save_as: cpu_clusters
+
+  - id: cluster_summary
+    type: atomic
+    name: "集群汇总"
+    display:
+      level: summary
+      layer: overview
+      title: "CPU 集群汇总"
+      columns:
+        - name: cluster_type
+          label: "核心类型"
+          type: string
+        - name: cpu_count
+          label: "CPU 数"
+          type: number
+        - name: cpus
+          label: "CPU 列表"
+          type: string
+        - name: max_freq_mhz
+          label: "最高频率"
+          type: number
+        - name: min_freq_mhz
+          label: "最低频率"
+          type: number
+        - name: topology_source
+          label: "判定来源"
+          type: string
+    sql: |
+      SELECT
+        core_type as cluster_type,
+        COUNT(*) as cpu_count,
+        GROUP_CONCAT(cpu_id, ', ') as cpus,
+        CASE WHEN MAX(max_freq) IS NULL THEN NULL ELSE ROUND(MAX(max_freq) / 1000.0, 0) END as max_freq_mhz,
+        CASE WHEN MIN(max_freq) IS NULL THEN NULL ELSE ROUND(MIN(max_freq) / 1000.0, 0) END as min_freq_mhz,
+        GROUP_CONCAT(DISTINCT topology_source) as topology_source,
+        CASE core_type
+          WHEN 'prime' THEN 1
+          WHEN 'big' THEN 2
+          WHEN 'medium' THEN 3
+          WHEN 'little' THEN 4
+          ELSE 5
+        END as cluster_order
+      FROM _cpu_topology
+      GROUP BY core_type
+      ORDER BY cluster_order
+    save_as: cluster_summary
+
+  - id: cluster_mapping
+    type: atomic
+    name: "集群映射"
+    sql: |
+      SELECT
+        cpu_id as cpu,
+        max_freq as max_freq_khz,
+        core_type as cluster_type,
+        CASE
+          WHEN core_type IN ('prime', 'big', 'medium') THEN 'big'
+          WHEN core_type = 'little' THEN 'little'
+          ELSE 'unknown'
+        END as simple_cluster_type,
+        topology_source
+      FROM _cpu_topology
+      ORDER BY cpu_id
+    save_as: cluster_mapping
+
+output:
+  format: structured
+  fields:
+    - name: cpu_clusters
+      description: "每个 CPU 核心的集群类型"
+    - name: cluster_summary
+      description: "集群汇总（每种类型的核心数）"
+    - name: cluster_mapping
+      description: "集群映射表（供其他 skill 使用）"

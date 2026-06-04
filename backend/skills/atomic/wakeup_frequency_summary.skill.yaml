@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# Wakeup Frequency Summary
+# =============================================================================
+# Separates device suspend wakeups from CPU idle exits. They are related power
+# symptoms but not the same root-cause signal.
+
+name: wakeup_frequency_summary
+version: "1.0"
+type: atomic
+category: power
+tier: B
+
+meta:
+  display_name: "唤醒频率摘要"
+  description: "区分设备级 wakeup 与 CPU idle exit churn，按分钟归一化"
+  icon: "notifications_active"
+  tags: [power, wakeup, suspend, cpuidle, frequency, atomic]
+
+prerequisites:
+  modules:
+    - android.wakeups
+    - linux.cpu.idle
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+steps:
+  - id: wakeup_frequency
+    type: atomic
+    name: "唤醒频率"
+    display:
+      level: summary
+      layer: overview
+      title: "设备唤醒与 CPU Idle Exit"
+      columns:
+        - name: window_min
+          label: "窗口(分钟)"
+          type: number
+          format: compact
+        - name: device_wakeup_count
+          label: "设备唤醒数"
+          type: number
+          format: compact
+        - name: device_wakeups_per_min
+          label: "设备唤醒/分钟"
+          type: number
+          format: compact
+        - name: cpu_idle_exit_count
+          label: "CPU idle exit"
+          type: number
+          format: compact
+        - name: cpu_idle_exits_per_min
+          label: "CPU idle exit/分钟"
+          type: number
+          format: compact
+        - name: bad_wakeup_count
+          label: "低质量唤醒"
+          type: number
+          format: compact
+        - name: interpretation
+          label: "解释"
+          type: string
+    sql: |
+      WITH bounds AS (
+        SELECT
+          COALESCE(${start_ts}, trace_start()) AS start_ts,
+          COALESCE(${end_ts}, trace_end()) AS end_ts
+      ),
+      window AS (
+        SELECT MAX((end_ts - start_ts) / 60e9, 0) AS window_min
+        FROM bounds
+      ),
+      device_wakeups AS (
+        SELECT
+          COUNT(*) AS wakeup_count,
+          SUM(CASE WHEN suspend_quality = 'bad' THEN 1 ELSE 0 END) AS bad_wakeup_count
+        FROM android_wakeups, bounds
+        WHERE ts >= start_ts
+          AND ts < end_ts
+      ),
+      cpu_idle_exits AS (
+        SELECT COUNT(*) AS idle_exit_count
+        FROM cpu_idle_counters, bounds
+        WHERE idle = -1
+          AND ts >= start_ts
+          AND ts < end_ts
+      )
+      SELECT
+        ROUND(window_min, 2) AS window_min,
+        wakeup_count AS device_wakeup_count,
+        ROUND(wakeup_count / NULLIF(window_min, 0), 2) AS device_wakeups_per_min,
+        idle_exit_count AS cpu_idle_exit_count,
+        ROUND(idle_exit_count / NULLIF(window_min, 0), 2) AS cpu_idle_exits_per_min,
+        bad_wakeup_count,
+        CASE
+          WHEN wakeup_count > 0 AND idle_exit_count > 0 THEN 'device_wakeup_and_cpu_idle_churn'
+          WHEN wakeup_count > 0 THEN 'device_suspend_wakeups'
+          WHEN idle_exit_count > 0 THEN 'cpu_idle_churn_only'
+          ELSE 'no_wakeup_signal'
+        END AS interpretation
+      FROM window, device_wakeups, cpu_idle_exits
+
+output:
+  format: structured

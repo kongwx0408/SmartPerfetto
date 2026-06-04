@@ -1,0 +1,428 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+name: selection_range_cpu_sched_summary
+version: "1.0"
+type: composite
+category: kernel
+tier: B
+
+meta:
+  display_name: "选区 CPU 调度与频率摘要"
+  description: "面向用户选区/可见窗口的快速 CPU 摆核、Running 排名、四象限和频率分布分析"
+  icon: "speed"
+  tags: [selection, range, cpu, sched, frequency, quadrant, migration, quick]
+
+triggers:
+  keywords:
+    zh: [选区, 这一段, 这段, 摆核, 核心摆放, 平均频率, 频率分布, Running 排名, 四象限]
+    en: [selection range, current window, cpu placement, core placement, average frequency, frequency distribution, running ranking, quadrant]
+  patterns:
+    - ".*(选区|这段|这一段).*(CPU|摆核|核心|频率|Running|四象限).*"
+    - ".*(selected|current).*(range|window).*(cpu|core|frequency|running|quadrant).*"
+
+prerequisites:
+  required_tables:
+    - thread_state
+    - thread
+    - process
+  modules:
+    - sched
+    - linux.cpu.frequency
+
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: true
+    description: "选区起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: true
+    description: "选区结束时间戳(ns)"
+  - name: package
+    type: string
+    required: false
+    description: "可选进程名过滤，支持 GLOB 前缀匹配"
+  - name: thread_name
+    type: string
+    required: false
+    description: "可选线程名包含匹配"
+  - name: top_k
+    type: number
+    required: false
+    description: "线程/进程排名返回数量"
+  - name: freq_bucket_mhz
+    type: number
+    required: false
+    description: "频率分布桶大小，单位 MHz"
+
+steps:
+  - id: init_cpu_topology
+    type: skill
+    name: "初始化 CPU 拓扑"
+    skill: cpu_topology_view
+    params:
+      start_ts: "${start_ts}"
+      end_ts: "${end_ts}"
+    display:
+      level: hidden
+    optional: true
+
+  - id: running_thread_quadrants
+    type: atomic
+    name: "Running 线程四象限与摆核"
+    optional: true
+    display:
+      level: key
+      layer: overview
+      title: "选区 Running 线程四象限"
+      columns:
+        - name: thread_name
+          label: "线程"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: tid
+          label: "TID"
+          type: number
+        - name: total_cpu_ms
+          label: "CPU 时间"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: q1_perf_running_ms
+          label: "Q1 性能核运行"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: q2_little_running_ms
+          label: "Q2 小核运行"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: q3_runnable_ms
+          label: "Q3 等待调度"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: q4a_io_blocked_ms
+          label: "Q4a IO 阻塞"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: q4b_sleeping_ms
+          label: "Q4b 睡眠等待"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: perf_core_pct
+          label: "性能核占比"
+          type: percentage
+          format: percentage
+        - name: running_cpus
+          label: "运行 CPU"
+          type: string
+        - name: running_core_types
+          label: "核心类型"
+          type: string
+        - name: migrations
+          label: "核迁移"
+          type: number
+        - name: cross_cluster_migrations
+          label: "跨簇迁移"
+          type: number
+    sql: |
+      WITH
+      target_threads AS (
+        SELECT
+          t.utid,
+          t.tid,
+          COALESCE(t.name, '<unknown>') AS thread_name,
+          p.upid,
+          p.pid,
+          COALESCE(p.name, '<unknown>') AS process_name
+        FROM thread t
+        LEFT JOIN process p ON t.upid = p.upid
+        WHERE ('${package|}' = '' OR COALESCE(p.name, '') GLOB '${package|}*')
+          AND ('${thread_name|}' = '' OR COALESCE(t.name, '') GLOB '*${thread_name|}*')
+      ),
+      states AS (
+        SELECT
+          tt.utid,
+          tt.tid,
+          tt.thread_name,
+          tt.process_name,
+          ts.ts,
+          ts.state,
+          ts.cpu,
+          COALESCE(ct.core_type, 'unknown') AS core_type,
+          MIN(ts.ts + ts.dur, ${end_ts}) - MAX(ts.ts, ${start_ts}) AS clipped_dur
+        FROM thread_state ts
+        JOIN target_threads tt ON ts.utid = tt.utid
+        LEFT JOIN _cpu_topology ct ON ts.cpu = ct.cpu_id
+        WHERE ts.ts < ${end_ts}
+          AND ts.ts + ts.dur > ${start_ts}
+          AND ts.dur > 0
+      ),
+      running_events AS (
+        SELECT
+          utid,
+          ts,
+          cpu,
+          core_type,
+          LAG(cpu) OVER (PARTITION BY utid ORDER BY ts) AS prev_cpu,
+          LAG(core_type) OVER (PARTITION BY utid ORDER BY ts) AS prev_core_type
+        FROM states
+        WHERE state = 'Running' AND clipped_dur > 0
+      ),
+      migrations AS (
+        SELECT
+          utid,
+          SUM(CASE WHEN prev_cpu IS NOT NULL AND cpu != prev_cpu THEN 1 ELSE 0 END) AS migrations,
+          SUM(CASE WHEN prev_cpu IS NOT NULL AND cpu != prev_cpu AND core_type != prev_core_type THEN 1 ELSE 0 END) AS cross_cluster_migrations
+        FROM running_events
+        GROUP BY utid
+      )
+      SELECT
+        s.thread_name,
+        s.process_name,
+        s.tid,
+        ROUND(SUM(CASE WHEN s.state = 'Running' THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS total_cpu_ms,
+        ROUND(SUM(CASE WHEN s.state = 'Running' AND s.core_type IN ('prime', 'big', 'medium') THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q1_perf_running_ms,
+        ROUND(SUM(CASE WHEN s.state = 'Running' AND s.core_type = 'little' THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q2_little_running_ms,
+        ROUND(SUM(CASE WHEN s.state IN ('R', 'R+') THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q3_runnable_ms,
+        ROUND(SUM(CASE WHEN s.state IN ('D', 'DK') THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q4a_io_blocked_ms,
+        ROUND(SUM(CASE WHEN s.state IN ('S', 'I') THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q4b_sleeping_ms,
+        ROUND(100.0 * SUM(CASE WHEN s.state = 'Running' AND s.core_type IN ('prime', 'big', 'medium') THEN s.clipped_dur ELSE 0 END)
+          / NULLIF(SUM(CASE WHEN s.state = 'Running' THEN s.clipped_dur ELSE 0 END), 0), 1) AS perf_core_pct,
+        GROUP_CONCAT(DISTINCT CASE WHEN s.state = 'Running' THEN s.cpu END) AS running_cpus,
+        GROUP_CONCAT(DISTINCT CASE WHEN s.state = 'Running' THEN s.core_type END) AS running_core_types,
+        COALESCE(m.migrations, 0) AS migrations,
+        COALESCE(m.cross_cluster_migrations, 0) AS cross_cluster_migrations
+      FROM states s
+      LEFT JOIN migrations m ON s.utid = m.utid
+      WHERE s.clipped_dur > 0
+      GROUP BY s.utid
+      HAVING total_cpu_ms > 0
+      ORDER BY total_cpu_ms DESC
+      LIMIT ${top_k|20}
+    save_as: running_thread_quadrants
+
+  - id: running_process_ranking
+    type: atomic
+    name: "Running 进程排名"
+    optional: true
+    display:
+      level: summary
+      layer: list
+      title: "选区 Running 进程排名"
+      columns:
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: pid
+          label: "PID"
+          type: number
+        - name: running_ms
+          label: "Running 时间"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: thread_count
+          label: "线程数"
+          type: number
+    sql: |
+      SELECT
+        COALESCE(p.name, '<unknown>') AS process_name,
+        p.pid,
+        ROUND(SUM(MIN(ts.ts + ts.dur, ${end_ts}) - MAX(ts.ts, ${start_ts})) / 1e6, 2) AS running_ms,
+        COUNT(DISTINCT ts.utid) AS thread_count
+      FROM thread_state ts
+      JOIN thread t ON ts.utid = t.utid
+      LEFT JOIN process p ON t.upid = p.upid
+      WHERE ts.ts < ${end_ts}
+        AND ts.ts + ts.dur > ${start_ts}
+        AND ts.dur > 0
+        AND ts.state = 'Running'
+        AND ('${package|}' = '' OR COALESCE(p.name, '') GLOB '${package|}*')
+        AND ('${thread_name|}' = '' OR COALESCE(t.name, '') GLOB '*${thread_name|}*')
+      GROUP BY p.upid
+      ORDER BY running_ms DESC
+      LIMIT ${top_k|20}
+    save_as: running_process_ranking
+
+  - id: cpu_freq_by_core
+    type: atomic
+    name: "各核 duration-weighted 频率"
+    optional: true
+    display:
+      level: summary
+      layer: list
+      title: "选区各核平均频率"
+      columns:
+        - name: cpu
+          label: "CPU"
+          type: number
+        - name: core_type
+          label: "核心类型"
+          type: string
+        - name: avg_freq_mhz
+          label: "平均频率"
+          type: number
+        - name: min_freq_mhz
+          label: "最低频率"
+          type: number
+        - name: max_freq_mhz
+          label: "最高频率"
+          type: number
+        - name: covered_ms
+          label: "覆盖时长"
+          type: duration
+          format: duration_ms
+          unit: ms
+    sql: |
+      WITH
+      cpu_tracks AS (
+        SELECT id, cpu
+        FROM cpu_counter_track
+        WHERE name = 'cpufreq' AND cpu IS NOT NULL
+      ),
+      freq_points AS (
+        SELECT
+          t.cpu,
+          ${start_ts} AS ts,
+          (
+            SELECT c2.value
+            FROM counter c2
+            WHERE c2.track_id = t.id AND c2.ts <= ${start_ts}
+            ORDER BY c2.ts DESC
+            LIMIT 1
+          ) AS freq_khz,
+          0 AS source_order
+        FROM cpu_tracks t
+        UNION ALL
+        SELECT t.cpu, c.ts, c.value AS freq_khz, 1 AS source_order
+        FROM counter c
+        JOIN cpu_tracks t ON c.track_id = t.id
+        WHERE c.ts >= ${start_ts} AND c.ts < ${end_ts}
+      ),
+      freq_spans AS (
+        SELECT
+          cpu,
+          freq_khz,
+          ts,
+          LEAD(ts, 1, ${end_ts}) OVER (PARTITION BY cpu ORDER BY ts, source_order) AS next_ts
+        FROM freq_points
+        WHERE freq_khz IS NOT NULL AND freq_khz > 0
+      ),
+      clipped AS (
+        SELECT
+          cpu,
+          freq_khz,
+          MIN(next_ts, ${end_ts}) - MAX(ts, ${start_ts}) AS dur_ns
+        FROM freq_spans
+        WHERE ts < ${end_ts} AND next_ts > ${start_ts}
+      )
+      SELECT
+        c.cpu,
+        COALESCE(ct.core_type, 'unknown') AS core_type,
+        ROUND(SUM(c.freq_khz * c.dur_ns) / NULLIF(SUM(c.dur_ns), 0) / 1000, 0) AS avg_freq_mhz,
+        ROUND(MIN(c.freq_khz) / 1000, 0) AS min_freq_mhz,
+        ROUND(MAX(c.freq_khz) / 1000, 0) AS max_freq_mhz,
+        ROUND(SUM(c.dur_ns) / 1e6, 2) AS covered_ms
+      FROM clipped c
+      LEFT JOIN _cpu_topology ct ON c.cpu = ct.cpu_id
+      WHERE c.dur_ns > 0
+      GROUP BY c.cpu
+      ORDER BY c.cpu
+    save_as: cpu_freq_by_core
+
+  - id: cpu_freq_distribution
+    type: atomic
+    name: "各核频率分布"
+    optional: true
+    display:
+      level: detail
+      layer: deep
+      title: "选区各核频率分布"
+      columns:
+        - name: cpu
+          label: "CPU"
+          type: number
+        - name: core_type
+          label: "核心类型"
+          type: string
+        - name: freq_mhz_bucket
+          label: "频率桶"
+          type: number
+        - name: duration_ms
+          label: "时长"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: pct_of_range
+          label: "区间占比"
+          type: percentage
+          format: percentage
+    sql: |
+      WITH
+      cpu_tracks AS (
+        SELECT id, cpu
+        FROM cpu_counter_track
+        WHERE name = 'cpufreq' AND cpu IS NOT NULL
+      ),
+      freq_points AS (
+        SELECT
+          t.cpu,
+          ${start_ts} AS ts,
+          (
+            SELECT c2.value
+            FROM counter c2
+            WHERE c2.track_id = t.id AND c2.ts <= ${start_ts}
+            ORDER BY c2.ts DESC
+            LIMIT 1
+          ) AS freq_khz,
+          0 AS source_order
+        FROM cpu_tracks t
+        UNION ALL
+        SELECT t.cpu, c.ts, c.value AS freq_khz, 1 AS source_order
+        FROM counter c
+        JOIN cpu_tracks t ON c.track_id = t.id
+        WHERE c.ts >= ${start_ts} AND c.ts < ${end_ts}
+      ),
+      freq_spans AS (
+        SELECT
+          cpu,
+          freq_khz,
+          ts,
+          LEAD(ts, 1, ${end_ts}) OVER (PARTITION BY cpu ORDER BY ts, source_order) AS next_ts
+        FROM freq_points
+        WHERE freq_khz IS NOT NULL AND freq_khz > 0
+      ),
+      clipped AS (
+        SELECT
+          cpu,
+          CAST(ROUND(freq_khz / (${freq_bucket_mhz|100} * 1000.0)) * ${freq_bucket_mhz|100} AS INTEGER) AS freq_mhz_bucket,
+          MIN(next_ts, ${end_ts}) - MAX(ts, ${start_ts}) AS dur_ns
+        FROM freq_spans
+        WHERE ts < ${end_ts} AND next_ts > ${start_ts}
+      )
+      SELECT
+        c.cpu,
+        COALESCE(ct.core_type, 'unknown') AS core_type,
+        c.freq_mhz_bucket,
+        ROUND(SUM(c.dur_ns) / 1e6, 2) AS duration_ms,
+        ROUND(100.0 * SUM(c.dur_ns) / NULLIF(${end_ts} - ${start_ts}, 0), 1) AS pct_of_range
+      FROM clipped c
+      LEFT JOIN _cpu_topology ct ON c.cpu = ct.cpu_id
+      WHERE c.dur_ns > 0
+      GROUP BY c.cpu, c.freq_mhz_bucket
+      ORDER BY c.cpu, duration_ms DESC
+      LIMIT 100
+    save_as: cpu_freq_distribution
+
+output:
+  format: structured

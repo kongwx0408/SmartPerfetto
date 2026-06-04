@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# 滚动响应延迟分析（原子 Skill）v2.0
+# =============================================================================
+# 使用 Perfetto stdlib android_input_events 测量滚动手势从 MOVE dispatch 到首帧开始的候选响应延迟。
+# 基于 slice 解析（sendMessage/receiveMessage），兼容大多数 atrace 配置。
+#
+# v2.0 变更：
+# - 从 android_input_event_dispatch (proto) 迁移到 android_input_events (slice-based)
+# - event_action 使用大写格式（MOVE, DOWN, UP）
+# - 时间戳基准统一为 dispatch_ts
+#
+# 注意：android_input_events 仅包含完成完整 IPC 周期的事件；该 Skill 输出不是 panel present 延迟。
+# 手势分割逻辑：连续 MOVE 事件间隔 > 500ms 视为新手势。
+
+name: scroll_response_latency
+version: "2.0"
+type: atomic
+category: input_response
+tier: B
+
+meta:
+  display_name: "滚动响应延迟 (区间)"
+  description: "基于 android_input_events 测量滚动手势从 MOVE dispatch 到首帧开始的候选响应延迟"
+  icon: "swipe_right"
+  tags: [scroll, response, latency, input, atomic]
+  # ----- Phase F: pipeline-aware 接口标注 -----
+  pipeline_aware: true
+  pipeline_aware_note: |
+    滑动响应路径不同：标准 input→Choreographer→ViewRoot；
+    Flutter texture 模式额外多一层宿主采样；WebView Functor 含 Chromium 路径；
+    RN input→main→Bridge/JSI→mqt_js。未来按 pipeline_id 调整响应路径解析。
+
+prerequisites:
+  modules:
+    - android.input
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "目标进程名（支持 GLOB）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+display:
+  level: key
+  layer: list
+  title: "滚动响应延迟"
+  columns:
+    - name: gesture_ts
+      label: "手势时间"
+      type: timestamp
+      unit: ns
+      clickAction: navigate_timeline
+    - name: process_name
+      label: "进程"
+      type: string
+    - name: response_latency_ms
+      label: "响应延迟"
+      type: duration
+      format: duration_ms
+    - name: first_frame_dur_ms
+      label: "首帧耗时"
+      type: duration
+      format: duration_ms
+    - name: rating
+      label: "评级"
+      type: string
+
+sql: |
+  WITH move_events AS (
+    SELECT
+      dispatch_ts as input_ts,
+      process_name,
+      upid,
+      ROW_NUMBER() OVER (PARTITION BY upid ORDER BY dispatch_ts) as move_idx
+    FROM android_input_events
+    WHERE (process_name GLOB '${package}*' OR '${package}' = '')
+      AND event_action = 'MOVE'
+      AND (${start_ts} IS NULL OR dispatch_ts >= ${start_ts})
+      AND (${end_ts} IS NULL OR dispatch_ts <= ${end_ts})
+  ),
+  gesture_starts AS (
+    SELECT
+      m1.input_ts as gesture_ts,
+      m1.process_name,
+      m1.upid
+    FROM move_events m1
+    LEFT JOIN move_events m2 ON m1.upid = m2.upid AND m2.move_idx = m1.move_idx - 1
+    WHERE m2.input_ts IS NULL OR (m1.input_ts - m2.input_ts) > 500000000
+  ),
+  first_frames AS (
+    SELECT
+      g.gesture_ts,
+      g.process_name,
+      MIN(f.ts) as frame_ts,
+      (SELECT f2.dur FROM actual_frame_timeline_slice f2
+       WHERE f2.upid = g.upid AND f2.ts >= g.gesture_ts
+       ORDER BY f2.ts LIMIT 1) as frame_dur
+    FROM gesture_starts g
+    LEFT JOIN actual_frame_timeline_slice f ON f.upid = g.upid AND f.ts >= g.gesture_ts
+    GROUP BY g.gesture_ts, g.process_name
+  )
+  SELECT
+    printf('%d', gesture_ts) as gesture_ts,
+    process_name,
+    printf('%d', frame_ts) as first_frame_ts,
+    ROUND((frame_ts - gesture_ts) / 1e6, 2) as response_latency_ms,
+    ROUND(frame_dur / 1e6, 2) as first_frame_dur_ms,
+    CASE
+      WHEN (frame_ts - gesture_ts) / 1e6 < 50 THEN '优秀'
+      WHEN (frame_ts - gesture_ts) / 1e6 < 100 THEN '良好'
+      WHEN (frame_ts - gesture_ts) / 1e6 < 200 THEN '需优化'
+      ELSE '严重'
+    END as rating
+  FROM first_frames
+  WHERE frame_ts IS NOT NULL
+  ORDER BY response_latency_ms DESC
+
+output:
+  format: structured

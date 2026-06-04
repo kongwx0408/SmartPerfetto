@@ -1,0 +1,2 @@
+# Source maps — not needed at runtime, keep repo lean
+*.map

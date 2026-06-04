@@ -1,0 +1,65 @@
+# Dependencies (rebuilt in container)
+node_modules/
+*/node_modules/
+perfetto/ui/node_modules/
+# Docker images consume the checked-in provider UI under frontend/ and the
+# pinned trace_processor_shell prebuilt. The full Perfetto submodule is not
+# part of the user image build context.
+perfetto/
+
+# Build outputs (rebuilt in container)
+dist/
+build/
+*/dist/
+*/build/
+perfetto/out/
+
+# Runtime data
+backend/uploads/*
+backend/uploads/
+backend/data/*
+!backend/data/perfettoSqlIndex.light.json
+!backend/data/perfettoSqlIndex.json
+!backend/data/perfettoStdlibSymbols.json
+backend/data/sessions/*.db
+backend/data/sessions.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+backend/logs/
+*.log
+
+# Test data & outputs
+test-traces/
+backend/test-output/
+coverage/
+
+# Git
+.git/
+.gitmodules
+**/.git/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment (user provides via docker compose)
+.env
+.env.*
+backend/.env
+
+# Claude Code
+.claude/
+
+# Private
+private/
+Feature-Dev/
+
+# Docker itself
+Dockerfile
+docker-compose.yml
+.dockerignore

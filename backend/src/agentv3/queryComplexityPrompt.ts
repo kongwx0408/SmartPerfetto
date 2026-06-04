@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Gracker (Chris)
+// This file is part of SmartPerfetto. See LICENSE for details.
+
+import { loadPromptTemplate, renderTemplate } from './strategyLoader';
+import type { ComplexityClassifierInput } from './types';
+
+type ComplexityPromptInput = string | ComplexityClassifierInput;
+const MAX_PREVIOUS_QUERY_CHARS = 240;
+const MAX_PREVIOUS_FINDING_CHARS = 200;
+
+function formatPreviousQueries(input: ComplexityPromptInput): string {
+  if (typeof input === 'string') return 'none';
+  const previousQueries = (input.previousQueries ?? [])
+    .map(q => q.trim())
+    .filter(Boolean)
+    .map(q => q.length > MAX_PREVIOUS_QUERY_CHARS
+      ? `${q.slice(0, MAX_PREVIOUS_QUERY_CHARS)}...`
+      : q)
+    .slice(-3);
+  if (previousQueries.length === 0) return 'none';
+  return previousQueries.map((q, index) => `${index + 1}. ${q}`).join('\n');
+}
+
+function formatPreviousFindings(input: ComplexityPromptInput): string {
+  if (typeof input === 'string') return 'none';
+  const previousFindings = (input.previousFindings ?? [])
+    .map(f => f.trim())
+    .filter(Boolean)
+    .map(f => f.length > MAX_PREVIOUS_FINDING_CHARS
+      ? `${f.slice(0, MAX_PREVIOUS_FINDING_CHARS)}...`
+      : f)
+    .slice(-5);
+  if (previousFindings.length === 0) return 'none';
+  return previousFindings.map((f, index) => `${index + 1}. ${f}`).join('\n');
+}
+
+function promptVar(input: ComplexityPromptInput, key: keyof ComplexityClassifierInput): string {
+  if (typeof input === 'string') return 'unknown';
+  const value = input[key];
+  if (value === undefined || value === null) return 'unknown';
+  return String(value);
+}
+
+export function buildComplexityClassifierPrompt(input: ComplexityPromptInput): string {
+  const query = typeof input === 'string' ? input : input.query;
+  const template = loadPromptTemplate('prompt-complexity-classifier');
+  const vars = {
+    query,
+    sceneType: promptVar(input, 'sceneType'),
+    hasSelectionContext: promptVar(input, 'hasSelectionContext'),
+    hasReferenceTrace: promptVar(input, 'hasReferenceTrace'),
+    hasExistingFindings: promptVar(input, 'hasExistingFindings'),
+    hasPriorFullAnalysis: promptVar(input, 'hasPriorFullAnalysis'),
+    previousQueries: formatPreviousQueries(input),
+    previousFindings: formatPreviousFindings(input),
+  };
+  return template
+    ? renderTemplate(template, vars)
+    : [
+        'Classify this Android trace analysis query as "quick" (factual) or "full" (analysis).',
+        `Scene type: ${vars.sceneType}`,
+        `Previous queries:\n${vars.previousQueries}`,
+        `Previous findings:\n${vars.previousFindings}`,
+        `Query: ${query}`,
+        'Output JSON: {"complexity": "quick" or "full", "reason": "..."}',
+      ].join('\n');
+}

@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# CPU Idle 状态驻留（B 级 atomic）
+# =============================================================================
+# 使用 linux.cpu.idle 模块的 cpu_idle_counters 视图统计每个 CPU 在不同 idle
+# 状态（C0/C1/C2/...）的驻留计数。深度 idle 比例低 → 系统忙；高 → 省电。
+
+name: cpu_idle_state_residency
+version: "1.0"
+type: atomic
+category: cpu
+tier: B
+
+meta:
+  display_name: "CPU Idle 驻留"
+  description: "每 CPU 各 idle 状态的驻留计数"
+  icon: "battery_saver"
+  tags: [cpu, idle, residency, atomic]
+
+prerequisites:
+  modules:
+    - linux.cpu.idle
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+steps:
+  - id: idle_residency
+    type: atomic
+    name: "Idle 驻留计数"
+    display:
+      level: detail
+      layer: list
+      title: "CPU Idle 状态分布"
+      columns:
+        - name: cpu
+          label: "CPU"
+          type: number
+        - name: idle_state
+          label: "Idle 状态"
+          type: number
+        - name: total_time_ms
+          label: "驻留时长(ms)"
+          type: duration
+          format: duration_ms
+        - name: residency_pct
+          label: "驻留占比(%)"
+          type: percentage
+        - name: interval_count
+          label: "区间数"
+          type: number
+          format: compact
+    sql: |
+      WITH clipped AS (
+        SELECT
+          cpu,
+          idle AS idle_state,
+          MIN(ts + dur, COALESCE(${end_ts}, trace_end())) -
+            MAX(ts, COALESCE(${start_ts}, trace_start())) AS clipped_dur
+        FROM cpu_idle_counters
+        WHERE ts < COALESCE(${end_ts}, trace_end())
+          AND ts + dur > COALESCE(${start_ts}, trace_start())
+      ),
+      totals AS (
+        SELECT cpu, SUM(clipped_dur) AS total_dur
+        FROM clipped
+        WHERE clipped_dur > 0
+        GROUP BY cpu
+      )
+      SELECT
+        c.cpu,
+        c.idle_state,
+        ROUND(SUM(c.clipped_dur) / 1e6, 2) AS total_time_ms,
+        ROUND(SUM(c.clipped_dur) * 100.0 / NULLIF(t.total_dur, 0), 2) AS residency_pct,
+        COUNT(*) AS interval_count
+      FROM clipped c
+      JOIN totals t USING (cpu)
+      WHERE c.clipped_dur > 0
+      GROUP BY c.cpu, c.idle_state
+      ORDER BY c.cpu ASC, c.idle_state ASC

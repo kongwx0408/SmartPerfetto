@@ -1,0 +1,141 @@
+# Release Rules
+
+Read this file before any publish, package, tag, release, npm, Docker, or
+portable artifact task.
+
+## Release Surfaces
+
+SmartPerfetto has separate release surfaces. Do not assume one successful
+surface proves the others.
+
+| Surface | Artifact | User entry | Includes | Does not include |
+| --- | --- | --- | --- | --- |
+| npm CLI | `@gracker/smartperfetto` | `smp`, `smartperfetto` | CLI dist, backend runtime assets, Skills, Strategies, SQL, packaged `trace_processor_shell` prebuilts for supported targets | Web UI launcher, Docker image, portable app bundle |
+| GitHub portable | `smartperfetto-v<version>-windows-x64.zip`, `smartperfetto-v<version>-macos-arm64.zip`, `smartperfetto-v<version>-linux-x64.tar.gz` | bundled launcher | Node.js 24 runtime, native production dependencies, backend, committed `frontend/`, pinned `trace_processor_shell` | npm global install |
+| Docker Hub | Linux container image from `main` workflow | `docker compose -f docker-compose.hub.yml up -d` | backend, committed `frontend/`, pinned trace processor, Docker volumes | host Claude Code local auth |
+| Source checkout | Git repository | `./start.sh` | backend source, committed `frontend/`, optional `perfetto/` submodule for UI development | published artifact guarantees |
+
+The npm CLI requires user-provided Node.js `>=24 <25`. Portable packages bundle
+Node.js 24. Docker users do not need host Node.js. Native Windows source work
+should use WSL2; native Windows users should use the portable package.
+
+## Version Source
+
+- Root `package.json` is the project version source.
+- `npm run version:set -- <version>` must synchronize:
+  - `package.json`
+  - `package-lock.json`
+  - `backend/package.json`
+  - `backend/package-lock.json`
+- Verify with `npm run version:sync -- --check`.
+- Published npm versions are immutable. If a release bug escapes, fix it,
+  bump the next patch version, publish a new npm version, and supersede the
+  GitHub release instead of mutating the published version.
+
+## Public Release Sequence
+
+1. Fetch and inspect current state:
+   - `git status --short --branch`
+   - `git fetch --tags origin`
+   - `npm view @gracker/smartperfetto version --json`
+   - `gh release view v<version>` when checking an existing release
+2. Start from a clean, up-to-date `main`.
+3. Confirm Node.js 24 is active. Do not publish from Node 25.
+4. Run the verification tier that matches the change. For release-process,
+   portable, CLI packaging, runtime asset, or version-sync changes, follow
+   `.claude/rules/testing.md`.
+5. Bump and commit the version:
+   ```bash
+   npm run version:set -- <version>
+   npm run version:sync -- --check
+   git add package.json package-lock.json backend/package.json backend/package-lock.json
+   git commit -m "chore: release v<version>"
+   git push origin main
+   ```
+6. Publish the npm CLI:
+   ```bash
+   npm whoami
+   npm --prefix backend run cli:pack-check
+   cd backend
+   npm publish --access public
+   cd ..
+   npm view @gracker/smartperfetto version --json
+   ```
+   For a new scope or org, verify scope permission first. Publishing can
+   return success before registry metadata is fully visible; wait and verify
+   both `npm view` and an isolated install before calling the npm release done.
+   Do not use `npm --prefix backend publish --access public`: npm can still
+   resolve the publish target as the repository root package, hit the root
+   `private` guard, and fail with `EPRIVATE` without publishing
+   `@gracker/smartperfetto`.
+7. Run isolated npm smoke in a temp directory:
+   ```bash
+   npm install @gracker/smartperfetto@<version>
+   ./node_modules/.bin/smp --version
+   ./node_modules/.bin/smartperfetto --help
+   ./node_modules/.bin/smp doctor --format json
+   ```
+8. Build and publish portable GitHub assets:
+   ```bash
+   npm run package:portable
+   npm run release:portable -- <version> --skip-build --no-draft
+   gh release view v<version> --json tagName,isDraft,assets
+   ```
+9. Re-check `git status --short --branch`. Generated `dist/portable/`,
+   `dist/windows-exe/`, and cache outputs must not be staged.
+
+## npm CLI Invariants
+
+- `backend/package.json` package name is `@gracker/smartperfetto`.
+- The package must expose both `smp` and `smartperfetto` bins.
+- `npm --prefix backend run cli:pack-check` must verify package contents before
+  publish.
+- Publish from the `backend/` working directory with `npm publish --access
+  public`; do not publish with `npm --prefix backend publish`.
+- The packed CLI must contain runtime assets needed by `doctor`, `query`,
+  `skill`, `run`, `ask`, `repl`, `compare`, and `report export`.
+- Do not publish if dry-run or pack-check reports missing bin files,
+  missing runtime assets, wrong version, or an unsupported Node engine.
+
+## Portable Release Invariants
+
+- Asset names and top-level directories must be versioned:
+  - `smartperfetto-v<version>-windows-x64.zip`
+  - `smartperfetto-v<version>-macos-arm64.zip`
+  - `smartperfetto-v<version>-linux-x64.tar.gz`
+- Do not publish old unversioned asset names.
+- Do not use `--allow-dirty` for public releases.
+- `--skip-build` is allowed only when the existing packages were freshly built
+  for the exact version and commit being released.
+- The package manifest must report `gitDirty: false` and `gitCommit` equal to
+  the release target commit.
+- macOS releases are ad-hoc signed by default. Public notarized releases need
+  `SMARTPERFETTO_MACOS_SIGN_IDENTITY` and
+  `SMARTPERFETTO_MACOS_NOTARY_PROFILE`.
+
+## Docker Release Notes
+
+Docker Hub images are produced by repository workflow from `main`. When a task
+changes Dockerfile, compose files, `frontend/` consumption, trace-processor
+setup, provider env behavior, or startup scripts, verify the Docker path and
+update Docker docs. Do not describe a manual Docker publish as complete unless
+the workflow or image tag is verified.
+
+## Secret Handling
+
+- Never commit npm tokens, provider keys, GitHub tokens, or temporary `.npmrc`
+  files.
+- Do not echo tokens into logs, docs, commit messages, release notes, or final
+  summaries.
+- Prefer environment variables or npm's normal auth store for one-off publish
+  work.
+- If a token was pasted into a chat or terminal transcript, recommend rotation
+  after the release is verified.
+
+## Release Bug Policy
+
+- Small documentation or release-note mistakes: fix docs, commit, push.
+- Package/runtime bug after npm publish: fix, verify, bump next patch version,
+  publish npm again, then publish matching portable assets.
+- Major runtime regression: stop promoting the bad version, document the
+  blocker, fix with targeted tests, then publish a superseding release.

@@ -1,0 +1,388 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# Binder 事务详细分析（组合 Skill）v2.0
+# =============================================================================
+# 分析单个慢 Binder 事务的详细信息，包括：
+# - CPU 大小核占比
+# - 四大象限分析：Running/Runnable/Sleeping 分布
+# - 阻塞原因分析
+# v2.0: 复用 _cpu_topology 视图替代内联 CTE，统一核心分类
+
+name: binder_detail
+version: "2.0"
+type: composite
+category: kernel
+tier: S
+
+meta:
+  display_name: "Binder 详情分析"
+  description: "深入分析单个 Binder 事务"
+  icon: "link_off"
+  tags: [binder, detail, composite]
+
+prerequisites:
+  required_tables:
+    - slice
+
+inputs:
+  - name: binder_ts
+    type: timestamp
+    required: true
+    description: "Binder 开始时间戳(ns)"
+  - name: binder_end_ts
+    type: timestamp
+    required: true
+    description: "Binder 结束时间戳(ns)"
+  - name: dur_ms
+    type: number
+    required: true
+    description: "Binder 耗时(ms)"
+  - name: server_process
+    type: string
+    required: true
+    description: "服务进程"
+  - name: aidl_name
+    type: string
+    required: false
+    description: "AIDL 方法名"
+  - name: process_name
+    type: string
+    required: true
+    description: "客户端进程名"
+  # Perfetto 跳转参数
+  - name: perfetto_start
+    type: timestamp
+    required: false
+    description: "Perfetto 跳转开始时间"
+  - name: perfetto_end
+    type: timestamp
+    required: false
+    description: "Perfetto 跳转结束时间"
+
+identity:
+  policy: required
+  scope: process
+  aliases: [process_name, package]
+  rewriteTo: recommended_process_name_param
+
+steps:
+  # ========== 初始化 CPU 拓扑 ==========
+  - id: init_cpu_topology
+    type: skill
+    name: "初始化 CPU 拓扑"
+    skill: cpu_topology_view
+    display:
+      level: hidden
+    optional: true
+
+  # ========== Binder 基本信息 ==========
+  - id: binder_info
+    type: atomic
+    name: "Binder 基本信息"
+    display:
+      level: key
+      layer: deep
+      title: "Binder 详情"
+      columns:
+        - name: server_process
+          label: "服务进程"
+          type: string
+        - name: aidl_name
+          label: "AIDL 方法"
+          type: string
+        - name: client_process
+          label: "客户端进程"
+          type: string
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: binder_ts
+          label: "开始时间"
+          type: timestamp
+          clickAction: navigate_range
+          durationColumn: binder_end_ts
+        - name: binder_end_ts
+          label: "结束时间"
+          type: timestamp
+          clickAction: navigate_timeline
+          hidden: true
+        - name: rating
+          label: "评级"
+          type: string
+    sql: |
+      SELECT
+        '${server_process}' as server_process,
+        '${aidl_name}' as aidl_name,
+        '${process_name}' as client_process,
+        ROUND(${dur_ms}, 2) as dur_ms,
+        printf('%d', ${binder_ts}) as binder_ts,
+        printf('%d', ${binder_end_ts}) as binder_end_ts,
+        -- Perfetto 跳转链接参数
+        printf('%d', COALESCE(${perfetto_start}, ${binder_ts})) as perfetto_start,
+        printf('%d', COALESCE(${perfetto_end}, ${binder_end_ts})) as perfetto_end,
+        -- 评级
+        CASE
+          WHEN ${dur_ms} > 50 THEN '严重'
+          WHEN ${dur_ms} > 16 THEN '需优化'
+          ELSE '正常'
+        END as rating
+    save_as: binder_basic
+
+  # ========== 大小核占比分析 ==========
+  - id: cpu_core_analysis
+    type: atomic
+    name: "大小核占比分析"
+    display:
+      level: key
+      layer: deep
+      title: "大小核占比"
+      columns:
+        - name: thread_type
+          label: "线程"
+          type: string
+        - name: big_core_ms
+          label: "大核运行"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: little_core_ms
+          label: "小核运行"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: total_running_ms
+          label: "总 Running"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: running_pct
+          label: "Running 占比"
+          type: percentage
+          format: percentage
+    sql: |
+      WITH main_thread AS (
+        SELECT t.utid, t.tid, p.pid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE p.name GLOB '${process_name}*'
+          AND t.tid = p.pid
+      ),
+      cpu_time AS (
+        SELECT
+          ss.cpu,
+          SUM(
+            MIN(ss.ts + ss.dur, ${binder_end_ts}) - MAX(ss.ts, ${binder_ts})
+          ) / 1e6 as dur_ms,
+          COALESCE(ct.core_type, 'unknown') as core_type
+        FROM sched_slice ss
+        JOIN main_thread mt ON ss.utid = mt.utid
+        LEFT JOIN _cpu_topology ct ON ss.cpu = ct.cpu_id
+        WHERE ss.ts < ${binder_end_ts}
+          AND ss.ts + ss.dur > ${binder_ts}
+        GROUP BY ss.cpu
+      )
+      SELECT
+        'MainThread' as thread_type,
+        ROUND(SUM(CASE WHEN core_type IN ('prime', 'big') THEN dur_ms ELSE 0 END), 2) as big_core_ms,
+        ROUND(SUM(CASE WHEN core_type IN ('medium', 'little') THEN dur_ms ELSE 0 END), 2) as little_core_ms,
+        ROUND(SUM(dur_ms), 2) as total_running_ms,
+        ROUND(100.0 * SUM(dur_ms) / ${dur_ms}, 1) as running_pct
+      FROM cpu_time
+      GROUP BY 1
+    save_as: cpu_core
+
+  # ========== 四大象限分析 ==========
+  - id: quadrant_analysis
+    type: atomic
+    name: "四大象限分析"
+    optional: true
+    display:
+      level: key
+      layer: deep
+      title: "四大象限分析"
+      columns:
+        - name: thread_type
+          label: "线程"
+          type: string
+        - name: q1_big_running_ms
+          label: "Q1 大核 Running"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: q2_little_running_ms
+          label: "Q2 小核 Running"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: q3_runnable_ms
+          label: "Q3 Runnable"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: q4_sleeping_ms
+          label: "Q4 Sleeping"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: total_ms
+          label: "总时间"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: sleeping_pct
+          label: "Sleeping 占比"
+          type: percentage
+          format: percentage
+    sql: |
+      WITH main_thread AS (
+        SELECT t.utid, t.tid, p.pid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE p.name GLOB '${process_name}*'
+          AND t.tid = p.pid
+      ),
+      thread_states AS (
+        SELECT
+          ts.state,
+          ts.cpu,
+          ts.blocked_function,
+          SUM(
+            MIN(ts.ts + ts.dur, ${binder_end_ts}) - MAX(ts.ts, ${binder_ts})
+          ) / 1e6 as dur_ms
+        FROM thread_state ts
+        JOIN main_thread mt ON ts.utid = mt.utid
+        WHERE ts.ts < ${binder_end_ts}
+          AND ts.ts + ts.dur > ${binder_ts}
+        GROUP BY ts.state, ts.cpu, ts.blocked_function
+      ),
+      quadrant_data AS (
+        SELECT
+          CASE
+            WHEN state = 'Running' AND COALESCE((SELECT core_type FROM _cpu_topology WHERE cpu_id = thread_states.cpu), 'unknown') IN ('prime', 'big') THEN 'Q1_big_running'
+            WHEN state = 'Running' THEN 'Q2_little_running'
+            WHEN state IN ('R', 'R+') THEN 'Q3_runnable'
+            WHEN state IN ('S', 'D', 'I') THEN 'Q4_sleeping'
+            ELSE 'other'
+          END as quadrant,
+          dur_ms
+        FROM thread_states
+      )
+      SELECT
+        'MainThread' as thread_type,
+        ROUND(SUM(CASE WHEN quadrant = 'Q1_big_running' THEN dur_ms ELSE 0 END), 2) as q1_big_running_ms,
+        ROUND(SUM(CASE WHEN quadrant = 'Q2_little_running' THEN dur_ms ELSE 0 END), 2) as q2_little_running_ms,
+        ROUND(SUM(CASE WHEN quadrant = 'Q3_runnable' THEN dur_ms ELSE 0 END), 2) as q3_runnable_ms,
+        ROUND(SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ms ELSE 0 END), 2) as q4_sleeping_ms,
+        ROUND(SUM(dur_ms), 2) as total_ms,
+        -- 百分比（Binder 期间主要是 Sleeping）
+        ROUND(100.0 * SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ms ELSE 0 END) /
+              NULLIF(SUM(dur_ms), 0), 1) as sleeping_pct
+      FROM quadrant_data
+      GROUP BY 1
+    save_as: quadrant
+
+  # ========== 阻塞原因分析 ==========
+  - id: blocking_analysis
+    type: atomic
+    name: "阻塞原因分析"
+    optional: true
+    display:
+      level: key
+      layer: deep
+      title: "阻塞原因"
+      columns:
+        - name: state
+          label: "线程状态"
+          type: string
+        - name: state_desc
+          label: "状态说明"
+          type: string
+        - name: blocked_function
+          label: "阻塞函数"
+          type: string
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: count
+          label: "次数"
+          type: number
+          format: compact
+    sql: |
+      WITH main_thread AS (
+        SELECT t.utid, t.tid, p.pid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE p.name GLOB '${process_name}*'
+          AND t.tid = p.pid
+      )
+      SELECT
+        ts.state,
+        CASE ts.state
+          WHEN 'Running' THEN 'Running (CPU执行)'
+          WHEN 'R' THEN 'Runnable (等待调度)'
+          WHEN 'S' THEN 'Sleeping (等待Binder回复)'
+          WHEN 'D' THEN 'Disk Sleep (IO等待)'
+          ELSE ts.state
+        END as state_desc,
+        ts.blocked_function,
+        ROUND(SUM(
+          MIN(ts.ts + ts.dur, ${binder_end_ts}) - MAX(ts.ts, ${binder_ts})
+        ) / 1e6, 2) as dur_ms,
+        COUNT(*) as count
+      FROM thread_state ts
+      JOIN main_thread mt ON ts.utid = mt.utid
+      WHERE ts.ts < ${binder_end_ts}
+        AND ts.ts + ts.dur > ${binder_ts}
+      GROUP BY ts.state, ts.blocked_function
+      ORDER BY dur_ms DESC
+      LIMIT 5
+    save_as: blocking
+
+  # ========== Binder 诊断 ==========
+  - id: binder_diagnosis
+    type: diagnostic
+    name: "Binder 诊断"
+    display:
+      level: key
+      layer: deep
+      title: "问题诊断"
+    inputs: [binder_basic, cpu_core, quadrant, blocking]
+    rules:
+      # Sleeping 占比过高（正常的 Binder 等待）
+      - condition: "quadrant.data[0]?.sleeping_pct > 90"
+        severity: info
+        diagnosis: "主线程在等待 Binder 回复 (${quadrant.data[0].sleeping_pct}% Sleeping)"
+        confidence: high
+        suggestions:
+          - "服务端处理时间过长"
+          - "考虑使用异步 Binder"
+
+      # 有明显的 Running 时间（客户端也在工作）
+      - condition: "cpu_core.data[0]?.running_pct > 30"
+        severity: info
+        diagnosis: "Binder 期间主线程 Running 占比 ${cpu_core.data[0].running_pct}%"
+        confidence: medium
+        suggestions:
+          - "可能存在客户端序列化开销"
+          - "检查传输数据大小"
+
+      # Runnable 等待
+      - condition: "quadrant.data[0]?.q3_runnable_ms > 5"
+        severity: warning
+        diagnosis: "主线程 Runnable 等待 ${quadrant.data[0].q3_runnable_ms}ms"
+        confidence: medium
+        suggestions:
+          - "CPU 资源争抢"
+          - "检查系统负载"
+
+output:
+  display:
+    level: key
+    format: summary

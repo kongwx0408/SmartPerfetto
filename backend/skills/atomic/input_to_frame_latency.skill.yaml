@@ -1,0 +1,436 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# 逐帧 Input-to-Display 延迟分析（原子 Skill）v2.0
+# =============================================================================
+# 核心跟手度 Skill：基于 Perfetto stdlib android_input_events 表的 5 维延迟分解，
+# 将每个 MotionEvent 与消费它的帧关联，计算逐帧 input-to-display 延迟。
+#
+# v2.0 变更：
+# - 从 android_input_event_dispatch (proto) 迁移到 android_input_events (slice-based)
+# - 帧关联从时间窗口子查询改为 frame_id 精确 JOIN
+# - 新增 dispatch/handling/ack 管线分解
+# - 新增 is_speculative_frame 帧关联置信度
+# - 采样率检测迁移到 android_input_events
+#
+# 用于跟手度分析，而非首帧响应速度（scroll_response_latency）。
+# 数据源依赖：trace 需包含 input atrace category（sendMessage/receiveMessage slices）
+
+name: input_to_frame_latency
+version: "2.0"
+type: atomic
+category: input_response
+tier: A
+
+meta:
+  display_name: "逐帧 Input-to-Display 延迟"
+  description: "基于 android_input_events 测量每个 MotionEvent 到对应帧 present 的延迟，用于跟手度分析"
+  icon: "swipe_vertical"
+  tags: [touch_tracking, follow_finger, input, latency, per_frame, atomic]
+  # ----- Phase F: pipeline-aware 接口 -----
+  pipeline_aware: true
+  pipeline_aware_note: |
+    Input 触达"应用"的路径在不同 pipeline 下不同（S14 React Native / S10 Flutter / S09 WebView）：
+    - 标准 HWUI: input → main thread → Choreographer.doFrame
+    - Flutter: input → platform thread → 1.ui thread Animator::BeginFrame
+    - RN Old Arch: input → main → Bridge → mqt_js → Bridge → main → 原生 View
+    - RN New Arch: input → main → JSI → mqt_js → Fabric → main
+    未来按 pipeline_id 切换 input 路径与帧绑定 SQL。
+
+prerequisites:
+  modules:
+    - android.input
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "目标进程名（支持 GLOB）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+  - name: event_action_filter
+    type: string
+    required: false
+    description: "事件动作过滤（默认 MOVE）"
+  - name: pipeline_id
+    type: string
+    required: false
+    description: "Pipeline ID (Phase F: pipeline-aware optional input)"
+
+display:
+  level: detail
+  layer: list
+  title: "逐帧 Input-to-Display 延迟"
+  columns:
+    - name: input_ts
+      label: "输入时间"
+      type: timestamp
+      unit: ns
+      clickAction: navigate_timeline
+    - name: process_name
+      label: "进程"
+      type: string
+    - name: event_action
+      label: "事件"
+      type: string
+    - name: input_to_display_ms
+      label: "Input→Display"
+      type: duration
+      format: duration_ms
+    - name: dispatch_latency_ms
+      label: "分发延迟"
+      type: duration
+      format: duration_ms
+    - name: handling_ms
+      label: "处理延迟"
+      type: duration
+      format: duration_ms
+    - name: frame_dur_ms
+      label: "帧耗时"
+      type: duration
+      format: duration_ms
+    - name: frame_to_present_ms
+      label: "Frame→Present"
+      type: duration
+      format: duration_ms
+    - name: is_speculative
+      label: "推测帧"
+      type: boolean
+    - name: rating
+      label: "评级"
+      type: string
+
+steps:
+  # Step 1: 检测 VSync 周期（保持不变，android_input_events 不含 VSync 信息）
+  - id: vsync_period
+    type: atomic
+    name: "VSync 周期检测"
+    display:
+      level: summary
+      layer: overview
+      title: "VSync 配置"
+      columns:
+        - name: vsync_period_ns
+          label: "VSync 周期(ns)"
+          type: number
+        - name: refresh_rate_hz
+          label: "刷新率(Hz)"
+          type: number
+    sql: |
+      WITH vsync_intervals AS (
+        SELECT c.ts - LAG(c.ts) OVER (ORDER BY c.ts) as interval_ns
+        FROM counter c
+        JOIN counter_track t ON c.track_id = t.id
+        WHERE t.name = 'VSYNC-app'
+      ),
+      filtered AS (
+        SELECT interval_ns FROM vsync_intervals
+        WHERE interval_ns BETWEEN 5500000 AND 50000000
+      ),
+      snapped AS (
+        SELECT CASE
+          WHEN raw_ns BETWEEN 5500000 AND 6500000 THEN 6060606
+          WHEN raw_ns BETWEEN 6500001 AND 7500000 THEN 6944444
+          WHEN raw_ns BETWEEN 7500001 AND 9500000 THEN 8333333
+          WHEN raw_ns BETWEEN 9500001 AND 12500000 THEN 11111111
+          WHEN raw_ns BETWEEN 12500001 AND 20000000 THEN 16666667
+          WHEN raw_ns BETWEEN 20000001 AND 35000000 THEN 33333333
+          ELSE raw_ns
+        END AS vsync_period_ns
+        FROM (
+          SELECT CAST(PERCENTILE(interval_ns, 0.5) AS INTEGER) AS raw_ns
+          FROM filtered
+        )
+      )
+      SELECT
+        vsync_period_ns,
+        CAST(ROUND(1e9 / vsync_period_ns) AS INTEGER) as refresh_rate_hz
+      FROM snapped
+
+  # Step 2: 检测输入采样率（迁移到 android_input_events）
+  - id: input_sampling_rate
+    type: atomic
+    name: "输入采样率检测"
+    display:
+      level: summary
+      layer: overview
+      title: "触控采样率"
+      columns:
+        - name: median_interval_ms
+          label: "中位间隔(ms)"
+          type: number
+        - name: sampling_rate_hz
+          label: "采样率(Hz)"
+          type: number
+        - name: total_events
+          label: "事件总数"
+          type: number
+    sql: |
+      WITH move_events AS (
+        SELECT
+          dispatch_ts as ts,
+          dispatch_ts - LAG(dispatch_ts) OVER (ORDER BY dispatch_ts) as interval_ns
+        FROM android_input_events
+        WHERE (process_name GLOB '${package}*' OR '${package}' = '')
+          AND event_action = 'MOVE'
+          AND (${start_ts} IS NULL OR dispatch_ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR dispatch_ts <= ${end_ts})
+      ),
+      filtered AS (
+        SELECT interval_ns FROM move_events
+        WHERE interval_ns IS NOT NULL
+          AND interval_ns BETWEEN 1000000 AND 100000000
+      )
+      SELECT
+        ROUND(PERCENTILE(interval_ns, 0.5) / 1e6, 2) as median_interval_ms,
+        ROUND(1e9 / PERCENTILE(interval_ns, 0.5), 0) as sampling_rate_hz,
+        (SELECT COUNT(*) FROM move_events) as total_events
+      FROM filtered
+
+  # Step 3: 逐帧 Input-to-Display 延迟（核心改造：用 frame_id JOIN 帧表）
+  - id: per_frame_latency
+    type: atomic
+    name: "逐帧延迟"
+    display:
+      level: detail
+      layer: list
+      title: "逐帧 Input-to-Display 延迟"
+      columns:
+        - name: input_ts
+          label: "输入时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: event_action
+          label: "事件"
+          type: string
+        - name: input_to_display_ms
+          label: "Input→Display(ms)"
+          type: duration
+          format: duration_ms
+        - name: dispatch_latency_ms
+          label: "分发延迟(ms)"
+          type: duration
+          format: duration_ms
+        - name: handling_ms
+          label: "处理延迟(ms)"
+          type: duration
+          format: duration_ms
+        - name: ack_ms
+          label: "ACK延迟(ms)"
+          type: duration
+          format: duration_ms
+        - name: frame_dur_ms
+          label: "帧耗时(ms)"
+          type: duration
+          format: duration_ms
+        - name: frame_to_present_ms
+          label: "Frame→Present(ms)"
+          type: duration
+          format: duration_ms
+        - name: is_speculative
+          label: "推测帧"
+          type: boolean
+        - name: rating
+          label: "评级"
+          type: string
+    sql: |
+      WITH vsync_intervals AS (
+        SELECT c.ts - LAG(c.ts) OVER (ORDER BY c.ts) AS interval_ns
+        FROM counter c
+        JOIN counter_track t ON c.track_id = t.id
+        WHERE t.name = 'VSYNC-app'
+      ),
+      vsync_cfg AS (
+        SELECT COALESCE(
+          CAST(PERCENTILE(interval_ns, 0.5) AS INTEGER),
+          16666667
+        ) as period_ns
+        FROM vsync_intervals
+        WHERE interval_ns BETWEEN 5500000 AND 50000000
+      ),
+      input_with_frame AS (
+        SELECT
+          ie.dispatch_ts as input_ts,
+          ie.event_action,
+          ie.process_name,
+          ie.dispatch_latency_dur,
+          ie.handling_latency_dur,
+          ie.ack_latency_dur,
+          ie.end_to_end_latency_dur,
+          ie.is_speculative_frame,
+          -- 用 frame_id 精确 JOIN 帧表获取帧内分解
+          f.ts as frame_ts,
+          f.dur as frame_dur,
+          f.ts + f.dur as frame_present_ts
+        FROM android_input_events ie
+        LEFT JOIN actual_frame_timeline_slice f
+          ON ie.frame_id = f.surface_frame_token
+          AND ie.upid = f.upid
+        WHERE (ie.process_name GLOB '${package}*' OR '${package}' = '')
+          AND (ie.event_action = 'MOVE'
+               OR ('${event_action_filter}' != '' AND ie.event_action = '${event_action_filter}'))
+          AND (${start_ts} IS NULL OR ie.dispatch_ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR ie.dispatch_ts <= ${end_ts})
+      ),
+      -- 预计算 e2e 延迟，避免重复 COALESCE（优先用 stdlib 的 end_to_end，fallback 到手动计算）
+      with_latency AS (
+        SELECT
+          *,
+          COALESCE(end_to_end_latency_dur, frame_present_ts - input_ts) as e2e_ns
+        FROM input_with_frame
+        WHERE (end_to_end_latency_dur IS NOT NULL OR frame_present_ts IS NOT NULL)
+      )
+      SELECT
+        printf('%d', input_ts) as input_ts,
+        process_name,
+        event_action,
+        ROUND(e2e_ns / 1e6, 2) as input_to_display_ms,
+        ROUND(dispatch_latency_dur / 1e6, 2) as dispatch_latency_ms,
+        ROUND(handling_latency_dur / 1e6, 2) as handling_ms,
+        ROUND(ack_latency_dur / 1e6, 2) as ack_ms,
+        ROUND(frame_dur / 1e6, 2) as frame_dur_ms,
+        ROUND((frame_present_ts - frame_ts - COALESCE(frame_dur, 0)) / 1e6, 2) as frame_to_present_ms,
+        is_speculative_frame as is_speculative,
+        CASE
+          WHEN e2e_ns / 1e6 < 2 * (SELECT period_ns FROM vsync_cfg) / 1e6 THEN '优秀'
+          WHEN e2e_ns / 1e6 < 3 * (SELECT period_ns FROM vsync_cfg) / 1e6 THEN '良好'
+          WHEN e2e_ns / 1e6 < 4 * (SELECT period_ns FROM vsync_cfg) / 1e6 THEN '需优化'
+          ELSE '严重'
+        END as rating
+      FROM with_latency
+      WHERE e2e_ns > 0 AND e2e_ns < 500000000
+      ORDER BY input_ts
+
+  # Step 4: 统计摘要（迁移到 android_input_events）
+  - id: latency_statistics
+    type: atomic
+    name: "延迟统计"
+    display:
+      level: summary
+      layer: overview
+      title: "Input-to-Display 延迟统计"
+      columns:
+        - name: metric
+          label: "指标"
+          type: string
+        - name: value_ms
+          label: "值(ms)"
+          type: number
+    sql: |
+      WITH vsync_intervals AS (
+        SELECT c.ts - LAG(c.ts) OVER (ORDER BY c.ts) AS interval_ns
+        FROM counter c
+        JOIN counter_track t ON c.track_id = t.id
+        WHERE t.name = 'VSYNC-app'
+      ),
+      vsync_cfg AS (
+        SELECT COALESCE(
+          CAST(PERCENTILE(interval_ns, 0.5) AS INTEGER),
+          16666667
+        ) as period_ns
+        FROM vsync_intervals
+        WHERE interval_ns BETWEEN 5500000 AND 50000000
+      ),
+      valid AS (
+        SELECT end_to_end_latency_dur as latency_ns
+        FROM android_input_events
+        WHERE (process_name GLOB '${package}*' OR '${package}' = '')
+          AND event_action = 'MOVE'
+          AND (${start_ts} IS NULL OR dispatch_ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR dispatch_ts <= ${end_ts})
+          AND end_to_end_latency_dur IS NOT NULL
+          AND end_to_end_latency_dur > 0
+          AND end_to_end_latency_dur < 500000000
+      )
+      SELECT 'P50' as metric, ROUND(PERCENTILE(latency_ns, 0.5) / 1e6, 2) as value_ms FROM valid
+      UNION ALL
+      SELECT 'P90', ROUND(PERCENTILE(latency_ns, 0.9) / 1e6, 2) FROM valid
+      UNION ALL
+      SELECT 'P99', ROUND(PERCENTILE(latency_ns, 0.99) / 1e6, 2) FROM valid
+      UNION ALL
+      SELECT '均值', ROUND(AVG(latency_ns) / 1e6, 2) FROM valid
+      UNION ALL
+      SELECT '标准差', ROUND(SQRT(AVG(latency_ns * latency_ns) - AVG(latency_ns) * AVG(latency_ns)) / 1e6, 2) FROM valid
+      UNION ALL
+      SELECT '样本数', CAST(COUNT(*) AS REAL) FROM valid
+      UNION ALL
+      SELECT 'VSync周期(ms)', ROUND((SELECT period_ns FROM vsync_cfg) / 1e6, 2) FROM valid LIMIT 1
+
+  # Step 5: 延迟飙升检测（迁移到 android_input_events）
+  - id: latency_spikes
+    type: atomic
+    name: "延迟飙升检测"
+    display:
+      level: detail
+      layer: list
+      title: "延迟飙升点"
+      columns:
+        - name: input_ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: latency_ms
+          label: "延迟(ms)"
+          type: duration
+          format: duration_ms
+        - name: prev_latency_ms
+          label: "前帧延迟(ms)"
+          type: duration
+          format: duration_ms
+        - name: spike_ratio
+          label: "飙升倍数"
+          type: number
+        - name: is_speculative
+          label: "推测帧"
+          type: boolean
+    sql: |
+      WITH latencies AS (
+        SELECT
+          dispatch_ts as input_ts,
+          end_to_end_latency_dur as latency_ns,
+          is_speculative_frame
+        FROM android_input_events
+        WHERE (process_name GLOB '${package}*' OR '${package}' = '')
+          AND event_action = 'MOVE'
+          AND (${start_ts} IS NULL OR dispatch_ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR dispatch_ts <= ${end_ts})
+          AND end_to_end_latency_dur IS NOT NULL
+          AND end_to_end_latency_dur > 0
+          AND end_to_end_latency_dur < 500000000
+      ),
+      with_prev AS (
+        SELECT
+          input_ts,
+          latency_ns,
+          is_speculative_frame,
+          LAG(latency_ns) OVER (ORDER BY input_ts) as prev_latency_ns
+        FROM latencies
+      )
+      SELECT
+        printf('%d', input_ts) as input_ts,
+        ROUND(latency_ns / 1e6, 2) as latency_ms,
+        ROUND(prev_latency_ns / 1e6, 2) as prev_latency_ms,
+        ROUND(CAST(latency_ns AS REAL) / MAX(prev_latency_ns, 1), 1) as spike_ratio,
+        is_speculative_frame as is_speculative
+      FROM with_prev
+      WHERE prev_latency_ns IS NOT NULL
+        AND latency_ns > prev_latency_ns * 2
+        AND latency_ns > 30000000
+      ORDER BY spike_ratio DESC
+      LIMIT 20
+
+output:
+  format: structured

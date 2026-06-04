@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+#
+# Development wrapper: runs the CLI via tsx without compiling.
+# Usage: ./backend/scripts/smartperfetto-dev analyze <trace> ...
+#
+# For production use, run `npm run build` then `smartperfetto` after `npm link`.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND_DIR="$(dirname "$SCRIPT_DIR")"
+exec npx --prefix "$BACKEND_DIR" tsx "$BACKEND_DIR/src/cli-user/bin.ts" "$@"

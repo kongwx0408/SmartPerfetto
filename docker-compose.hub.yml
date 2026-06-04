@@ -1,0 +1,34 @@
+services:
+  smartperfetto:
+    image: w553000664/smartperfetto:latest
+    ports:
+      - "${SMARTPERFETTO_BACKEND_PORT:-3000}:${SMARTPERFETTO_BACKEND_PORT:-3000}"      # Backend API
+      - "${SMARTPERFETTO_FRONTEND_PORT:-10000}:${SMARTPERFETTO_FRONTEND_PORT:-10000}"  # Perfetto UI
+    environment:
+      - PORT=${SMARTPERFETTO_BACKEND_PORT:-3000}
+      - SMARTPERFETTO_BACKEND_PORT=${SMARTPERFETTO_BACKEND_PORT:-3000}
+      - SMARTPERFETTO_BACKEND_PUBLIC_PORT=${SMARTPERFETTO_BACKEND_PUBLIC_PORT:-${SMARTPERFETTO_BACKEND_PORT:-3000}}
+      - SMARTPERFETTO_BACKEND_PUBLIC_URL=${SMARTPERFETTO_BACKEND_PUBLIC_URL:-}
+      - SMARTPERFETTO_FRONTEND_PORT=${SMARTPERFETTO_FRONTEND_PORT:-10000}
+      - NODE_ENV=production
+      - FRONTEND_URL=http://localhost:${SMARTPERFETTO_FRONTEND_PORT:-10000}
+      - PROVIDER_DATA_DIR_OVERRIDE=/app/backend/provider-data
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - uploads:/app/backend/uploads
+      - logs:/app/backend/logs
+      - provider-data:/app/backend/provider-data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f \"http://localhost:$${SMARTPERFETTO_BACKEND_PORT:-$${PORT:-3000}}/health\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  uploads:
+  logs:
+  provider-data:

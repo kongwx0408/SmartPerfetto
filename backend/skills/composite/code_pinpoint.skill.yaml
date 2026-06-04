@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+name: code_pinpoint
+version: "1.0"
+type: composite
+tier: S
+
+meta:
+  display_name: "代码定位线索"
+  description: "从 trace 中提取可用于 codebase-aware resolve_symbol / lookup_source 的线程、slice、module 和 symbol 线索"
+  icon: "code"
+  tags: [codebase, symbol, source, root_cause]
+
+triggers:
+  keywords:
+    zh: [代码, 源码, 函数, 符号, patch, 修复建议, file line]
+    en: [code, source, symbol, function, patch, file line]
+
+prerequisites:
+  modules:
+    - slices.with_context
+    - android.process_metadata
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "应用包名或进程名（可选）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳（纳秒，可选）"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳（纳秒，可选）"
+
+identity:
+  policy: verify_if_present
+  scope: process
+  aliases: [package, process_name]
+  rewriteTo: recommended_process_name_param
+
+steps:
+  - id: hot_slices
+    type: atomic
+    name: "代码定位候选 slice"
+    display:
+      level: detail
+      layer: list
+      title: "Code Pinpoint Candidates"
+      columns:
+        - name: process_name
+          label: "Process"
+          type: string
+        - name: thread_name
+          label: "Thread"
+          type: string
+        - name: slice_name
+          label: "Slice"
+          type: string
+        - name: dur_ms
+          label: "Duration"
+          type: duration
+          unit: ms
+    sql: |
+      INCLUDE PERFETTO MODULE slices.with_context;
+
+      SELECT
+        process_name,
+        thread_name,
+        name AS slice_name,
+        ROUND(dur / 1e6, 3) AS dur_ms
+      FROM thread_slice
+      WHERE dur > 0
+        AND (${package} IS NULL OR process_name GLOB ${package} || '*')
+        AND (${start_ts} IS NULL OR ts >= ${start_ts})
+        AND (${end_ts} IS NULL OR ts + dur <= ${end_ts})
+      ORDER BY dur DESC
+      LIMIT 30;
+
+  - id: native_modules
+    type: atomic
+    name: "Native module / build-id 线索"
+    display:
+      level: debug
+      layer: deep
+      title: "Native Module Hints"
+      columns:
+        - name: module_name
+          label: "Module"
+          type: string
+        - name: build_id
+          label: "Build ID"
+          type: string
+        - name: frame_count
+          label: "Frames"
+          type: number
+    optional: true
+    sql: |
+      SELECT
+        COALESCE(m.name, '(unknown)') AS module_name,
+        COALESCE(m.build_id, '') AS build_id,
+        COUNT(*) AS frame_count
+      FROM stack_profile_frame f
+      JOIN stack_profile_mapping m ON f.mapping = m.id
+      GROUP BY module_name, build_id
+      ORDER BY frame_count DESC
+      LIMIT 30;

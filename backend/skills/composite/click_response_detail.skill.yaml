@@ -1,0 +1,800 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# 慢点击事件详细分析（组合 Skill）v2.0
+# =============================================================================
+# 分析单个慢输入事件的详细信息，包括：
+# - 延迟分解（dispatch/handling/ack）
+# - CPU 大小核占比
+# - 四大象限分析：Running/Runnable/Sleeping 分布
+# - 主线程阻塞原因
+# - Binder 调用分析
+# v2.0: 复用 _cpu_topology 视图替代内联 CTE，统一核心分类
+
+name: click_response_detail
+version: "2.0"
+type: composite
+category: interaction
+tier: S
+
+meta:
+  display_name: "点击详情分析"
+  description: "深入分析单个点击事件的处理流程"
+  icon: "gesture"
+  tags: [click, detail, interaction, composite]
+
+prerequisites:
+  required_tables:
+    - thread
+    - process
+    - thread_state
+    - sched_slice
+  modules:
+    - android.input
+    - android.binder
+    - linux.cpu.frequency
+
+inputs:
+  - name: event_ts
+    type: timestamp
+    required: true
+    description: "事件开始时间戳(ns)"
+  - name: event_end_ts
+    type: timestamp
+    required: true
+    description: "事件结束时间戳(ns)"
+  - name: total_ms
+    type: number
+    required: true
+    description: "dispatch-to-ACK 总延迟(ms)"
+  - name: dispatch_ms
+    type: number
+    required: false
+    description: "分发延迟(ms)"
+  - name: handling_ms
+    type: number
+    required: false
+    description: "处理延迟(ms)"
+  - name: event_type
+    type: string
+    required: false
+    description: "事件类型"
+  - name: event_action
+    type: string
+    required: false
+    description: "事件动作"
+  - name: process_name
+    type: string
+    required: true
+    description: "进程名"
+  # Perfetto 跳转参数
+  - name: perfetto_start
+    type: timestamp
+    required: false
+    description: "Perfetto 跳转开始时间"
+  - name: perfetto_end
+    type: timestamp
+    required: false
+    description: "Perfetto 跳转结束时间"
+
+steps:
+  # ========== 初始化 CPU 拓扑 ==========
+  - id: init_cpu_topology
+    type: skill
+    name: "初始化 CPU 拓扑"
+    skill: cpu_topology_view
+    display:
+      level: hidden
+    optional: true
+
+  # ========== 事件基本信息 ==========
+  - id: event_info
+    type: atomic
+    name: "事件基本信息"
+    display:
+      level: key
+      layer: deep
+      title: "事件详情"
+      columns:
+        - name: event_type
+          label: "事件类型"
+          type: string
+        - name: event_action
+          label: "事件动作"
+          type: string
+        - name: process_name
+          label: "进程名"
+          type: string
+        - name: total_ms
+          label: "总延迟(ACK)"
+          type: duration
+          format: duration_ms
+        - name: dispatch_ms
+          label: "分发延迟(ms)"
+          type: duration
+          format: duration_ms
+        - name: handling_ms
+          label: "处理延迟(ms)"
+          type: duration
+          format: duration_ms
+        - name: event_ts
+          label: "事件开始"
+          type: timestamp
+          clickAction: navigate_timeline
+        - name: event_end_ts
+          label: "事件结束"
+          type: timestamp
+          clickAction: navigate_timeline
+        - name: perfetto_start
+          label: "Perfetto开始"
+          type: timestamp
+          clickAction: navigate_range
+        - name: perfetto_end
+          label: "Perfetto结束"
+          type: timestamp
+          clickAction: navigate_timeline
+        - name: main_bottleneck
+          label: "主要瓶颈"
+          type: string
+        - name: rating
+          label: "评级"
+          type: string
+    sql: |
+      SELECT
+        '${event_type}' as event_type,
+        '${event_action}' as event_action,
+        '${process_name}' as process_name,
+        ROUND(${total_ms}, 2) as total_ms,
+        ROUND(COALESCE(${dispatch_ms}, 0), 2) as dispatch_ms,
+        ROUND(COALESCE(${handling_ms}, 0), 2) as handling_ms,
+        printf('%d', ${event_ts}) as event_ts,
+        printf('%d', ${event_end_ts}) as event_end_ts,
+        -- Perfetto 跳转链接参数
+        printf('%d', COALESCE(${perfetto_start}, ${event_ts})) as perfetto_start,
+        printf('%d', COALESCE(${perfetto_end}, ${event_end_ts})) as perfetto_end,
+        -- 延迟主要来源
+        CASE
+          WHEN COALESCE(${dispatch_ms}, 0) > COALESCE(${handling_ms}, 0) THEN '系统分发'
+          ELSE '应用处理'
+        END as main_bottleneck,
+        -- 评级
+        CASE
+          WHEN ${total_ms} > 200 THEN '严重'
+          WHEN ${total_ms} > 100 THEN '较慢'
+          ELSE '偏慢'
+        END as rating
+    save_as: event_basic
+
+  # ========== 输入分发管线分解 ==========
+  - id: input_dispatch_breakdown
+    type: atomic
+    name: "输入分发管线分解"
+    display:
+      level: detail
+      layer: deep
+      title: "输入分发管线 (kernel→InputDispatcher→App)"
+      columns:
+        - name: stage
+          label: "管线阶段"
+          type: string
+        - name: start_ts
+          label: "开始时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: dur_ms
+          label: "耗时(ms)"
+          type: duration
+          format: duration_ms
+        - name: thread_name
+          label: "线程"
+          type: string
+        - name: detail
+          label: "详情"
+          type: string
+    sql: |
+      -- 分解 Input dispatch 管线: kernel → InputDispatcher (system_server) → App
+      WITH dispatch_slices AS (
+        -- InputDispatcher 处理阶段 (system_server 进程)
+        SELECT
+          'InputDispatcher' as stage,
+          s.ts as start_ts,
+          s.dur,
+          t.name as thread_name,
+          s.name as detail
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        WHERE (p.name = 'system_server' OR p.name LIKE '/system/bin/%')
+          AND (s.name GLOB '*InputDispatcher*' OR s.name GLOB '*InputReader*' OR s.name GLOB '*dispatchMotion*')
+          AND s.ts >= (${event_ts} - 50000000)
+          AND s.ts <= (${event_ts} + 50000000)
+        UNION ALL
+        -- App 端接收阶段 (aq:pending:deliver)
+        SELECT
+          'App接收' as stage,
+          s.ts as start_ts,
+          s.dur,
+          t.name as thread_name,
+          s.name as detail
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        WHERE p.name GLOB '${process_name}*'
+          AND (s.name GLOB '*deliverInput*' OR s.name GLOB 'aq:pending:deliver*' OR s.name GLOB '*InputEvent*')
+          AND s.ts >= (${event_ts} - 10000000)
+          AND s.ts <= (${event_end_ts} + 10000000)
+      )
+      SELECT
+        stage,
+        printf('%d', start_ts) as start_ts,
+        ROUND(dur / 1e6, 2) as dur_ms,
+        thread_name,
+        detail
+      FROM dispatch_slices
+      ORDER BY start_ts
+      LIMIT 20
+    optional: true
+
+  # ========== 输入管线完整生命周期（stdlib _android_input_lifecycle_by_slice_id）==========
+  - id: input_pipeline_lifecycle
+    type: atomic
+    name: "输入管线生命周期"
+    optional: true
+    display:
+      level: detail
+      layer: deep
+      title: "输入管线 5 阶段追踪 (Reader→Dispatch→Receive→Consume→Frame)"
+      columns:
+        - name: input_id
+          label: "输入事件 ID"
+          type: string
+        - name: channel
+          label: "事件通道"
+          type: string
+        - name: total_latency_ms
+          label: "总延迟(ACK)"
+          type: duration
+          format: duration_ms
+        - name: reader_ts
+          label: "Reader 时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: reader_ms
+          label: "Reader(ms)"
+          type: duration
+          format: duration_ms
+        - name: dispatch_ts
+          label: "Dispatch 时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: dispatch_ms
+          label: "Dispatch(ms)"
+          type: duration
+          format: duration_ms
+        - name: receive_ts
+          label: "Receive 时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: receive_ms
+          label: "Receive(ms)"
+          type: duration
+          format: duration_ms
+        - name: consume_ts
+          label: "Consume 时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: consume_ms
+          label: "Consume(ms)"
+          type: duration
+          format: duration_ms
+        - name: frame_ts
+          label: "Frame 时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: frame_ms
+          label: "Frame(ms)"
+          type: duration
+          format: duration_ms
+        - name: is_speculative_frame
+          label: "推测帧"
+          type: boolean
+    sql: |
+      -- 从 deliverInputEvent slice 反向追踪完整输入管线
+      -- 注意：时间窗口匹配在事件密集场景下可能绑错事件，click 场景通常事件稀疏
+      WITH deliver_slice AS (
+        SELECT s.id
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        WHERE s.name GLOB 'deliverInputEvent src=*'
+          AND p.name GLOB '${process_name}*'
+          AND s.ts >= ${event_ts} - 10000000
+          AND s.ts <= ${event_end_ts} + 10000000
+        ORDER BY s.ts
+        LIMIT 1
+      )
+      SELECT
+        input_id,
+        channel,
+        ROUND(total_latency / 1e6, 2) as total_latency_ms,
+        printf('%d', ts_reader) as reader_ts,
+        ROUND(dur_reader / 1e6, 2) as reader_ms,
+        printf('%d', ts_dispatch) as dispatch_ts,
+        ROUND(dur_dispatch / 1e6, 2) as dispatch_ms,
+        printf('%d', ts_receive) as receive_ts,
+        ROUND(dur_receive / 1e6, 2) as receive_ms,
+        printf('%d', ts_consume) as consume_ts,
+        ROUND(dur_consume / 1e6, 2) as consume_ms,
+        printf('%d', ts_frame) as frame_ts,
+        ROUND(dur_frame / 1e6, 2) as frame_ms,
+        is_speculative_frame
+      FROM _android_input_lifecycle_by_slice_id((SELECT id FROM deliver_slice))
+    save_as: input_lifecycle
+
+  # ========== 大小核占比分析 ==========
+  - id: cpu_core_analysis
+    type: atomic
+    name: "大小核占比分析"
+    display:
+      level: key
+      layer: deep
+      title: "大小核占比"
+      columns:
+        - name: thread_type
+          label: "线程类型"
+          type: string
+        - name: big_core_ms
+          label: "大核运行(ms)"
+          type: number
+        - name: little_core_ms
+          label: "小核运行(ms)"
+          type: number
+        - name: total_running_ms
+          label: "总运行(ms)"
+          type: number
+        - name: big_core_pct
+          label: "大核占比(%)"
+          type: percentage
+          format: percentage
+        - name: little_core_pct
+          label: "小核占比(%)"
+          type: percentage
+          format: percentage
+        - name: running_pct
+          label: "运行占总时长(%)"
+          type: percentage
+          format: percentage
+        - name: used_cpus
+          label: "使用CPU"
+          type: string
+        - name: classify_method
+          label: "核判定来源"
+          type: string
+    sql: |
+      WITH main_thread AS (
+        SELECT t.utid, t.tid, p.pid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE p.name GLOB '${process_name}*'
+          AND t.tid = p.pid
+      ),
+      -- 检测拓扑分类来源（用于诊断置信度判断）
+      topology_meta AS (
+        SELECT
+          CASE
+            WHEN MAX(ct.capacity) > 0 THEN 'capacity'
+            WHEN EXISTS (SELECT 1 FROM cpu_counter_track WHERE name = 'cpufreq' LIMIT 1) THEN 'freq_rank'
+            ELSE 'cpu_id_fallback'
+          END as classify_method
+        FROM _cpu_topology ct
+      ),
+      cpu_time AS (
+        SELECT
+          ss.cpu,
+          SUM(
+            MIN(ss.ts + ss.dur, ${event_end_ts}) - MAX(ss.ts, ${event_ts})
+          ) / 1e6 as dur_ms,
+          COALESCE(ct.core_type, 'unknown') as core_type
+        FROM sched_slice ss
+        JOIN main_thread mt ON ss.utid = mt.utid
+        LEFT JOIN _cpu_topology ct ON ss.cpu = ct.cpu_id
+        WHERE ss.ts < ${event_end_ts}
+          AND ss.ts + ss.dur > ${event_ts}
+        GROUP BY ss.cpu
+      )
+      SELECT
+        'MainThread' as thread_type,
+        ROUND(SUM(CASE WHEN core_type IN ('prime', 'big') THEN dur_ms ELSE 0 END), 2) as big_core_ms,
+        ROUND(SUM(CASE WHEN core_type IN ('medium', 'little') THEN dur_ms ELSE 0 END), 2) as little_core_ms,
+        ROUND(SUM(dur_ms), 2) as total_running_ms,
+        ROUND(100.0 * SUM(CASE WHEN core_type IN ('prime', 'big') THEN dur_ms ELSE 0 END) /
+              NULLIF(SUM(dur_ms), 0), 1) as big_core_pct,
+        ROUND(100.0 * SUM(CASE WHEN core_type IN ('medium', 'little') THEN dur_ms ELSE 0 END) /
+              NULLIF(SUM(dur_ms), 0), 1) as little_core_pct,
+        ROUND(100.0 * SUM(dur_ms) / ${total_ms}, 1) as running_pct,
+        GROUP_CONCAT(DISTINCT cpu) as used_cpus,
+        (SELECT classify_method FROM topology_meta) as classify_method
+      FROM cpu_time
+      GROUP BY 1
+    save_as: cpu_core
+
+  # ========== 四大象限分析 ==========
+  - id: quadrant_analysis
+    type: atomic
+    name: "四大象限分析"
+    optional: true
+    display:
+      level: key
+      layer: deep
+      title: "四大象限分析"
+      columns:
+        - name: thread_type
+          label: "线程类型"
+          type: string
+        - name: q1_big_running_ms
+          label: "Q1大核运行(ms)"
+          type: number
+        - name: q2_little_running_ms
+          label: "Q2小核运行(ms)"
+          type: number
+        - name: q3_runnable_ms
+          label: "Q3可运行等待(ms)"
+          type: number
+        - name: q4_sleeping_ms
+          label: "Q4睡眠阻塞(ms)"
+          type: number
+        - name: total_ms
+          label: "总时长(ms)"
+          type: number
+        - name: runnable_pct
+          label: "Runnable占比(%)"
+          type: percentage
+          format: percentage
+        - name: sleeping_pct
+          label: "Sleeping占比(%)"
+          type: percentage
+          format: percentage
+        - name: classify_method
+          label: "核判定来源"
+          type: string
+    sql: |
+      WITH main_thread AS (
+        SELECT t.utid, t.tid, p.pid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE p.name GLOB '${process_name}*'
+          AND t.tid = p.pid
+      ),
+      -- 检测拓扑分类来源
+      topology_meta AS (
+        SELECT
+          CASE
+            WHEN MAX(ct.capacity) > 0 THEN 'capacity'
+            WHEN EXISTS (SELECT 1 FROM cpu_counter_track WHERE name = 'cpufreq' LIMIT 1) THEN 'freq_rank'
+            ELSE 'cpu_id_fallback'
+          END as classify_method
+        FROM _cpu_topology ct
+      ),
+      thread_states AS (
+        SELECT
+          ts.state,
+          COALESCE(ct.core_type, 'unknown') as core_type,
+          ts.blocked_function,
+          SUM(
+            MIN(ts.ts + ts.dur, ${event_end_ts}) - MAX(ts.ts, ${event_ts})
+          ) / 1e6 as dur_ms
+        FROM thread_state ts
+        JOIN main_thread mt ON ts.utid = mt.utid
+        LEFT JOIN _cpu_topology ct ON ts.cpu = ct.cpu_id
+        WHERE ts.ts < ${event_end_ts}
+          AND ts.ts + ts.dur > ${event_ts}
+        GROUP BY ts.state, ct.core_type, ts.blocked_function
+      ),
+      quadrant_data AS (
+        SELECT
+          CASE
+            WHEN state = 'Running' AND core_type IN ('prime', 'big') THEN 'Q1_big_running'
+            WHEN state = 'Running' AND core_type IN ('medium', 'little') THEN 'Q2_little_running'
+            WHEN state IN ('R', 'R+') THEN 'Q3_runnable'
+            WHEN state IN ('S', 'D', 'I') THEN 'Q4_sleeping'
+            ELSE 'other'
+          END as quadrant,
+          dur_ms
+        FROM thread_states
+      )
+      SELECT
+        'MainThread' as thread_type,
+        ROUND(SUM(CASE WHEN quadrant = 'Q1_big_running' THEN dur_ms ELSE 0 END), 2) as q1_big_running_ms,
+        ROUND(SUM(CASE WHEN quadrant = 'Q2_little_running' THEN dur_ms ELSE 0 END), 2) as q2_little_running_ms,
+        ROUND(SUM(CASE WHEN quadrant = 'Q3_runnable' THEN dur_ms ELSE 0 END), 2) as q3_runnable_ms,
+        ROUND(SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ms ELSE 0 END), 2) as q4_sleeping_ms,
+        ROUND(SUM(dur_ms), 2) as total_ms,
+        -- 百分比
+        ROUND(100.0 * SUM(CASE WHEN quadrant = 'Q3_runnable' THEN dur_ms ELSE 0 END) /
+              NULLIF(SUM(dur_ms), 0), 1) as runnable_pct,
+        ROUND(100.0 * SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ms ELSE 0 END) /
+              NULLIF(SUM(dur_ms), 0), 1) as sleeping_pct,
+        (SELECT classify_method FROM topology_meta) as classify_method
+      FROM quadrant_data
+      GROUP BY 1
+    save_as: quadrant
+
+  # ========== 主线程阻塞原因 ==========
+  - id: blocking_analysis
+    type: skill
+    name: "阻塞原因分析"
+    skill: main_thread_states_in_range
+    display:
+      level: key
+      layer: deep
+      title: "阻塞原因 Top5"
+      columns:
+        - name: state
+          label: "状态"
+          type: string
+        - name: state_desc
+          label: "状态说明"
+          type: string
+        - name: blocked_function
+          label: "阻塞函数"
+          type: string
+          format: code
+        - name: total_dur_ms
+          label: "总耗时"
+          type: duration
+          format: duration_ms
+        - name: pct
+          label: "区间占比"
+          type: percentage
+          format: percentage
+        - name: count
+          label: "次数"
+          type: number
+          format: compact
+    params:
+      start_ts: "${event_ts}"
+      end_ts: "${event_end_ts}"
+      package: "${process_name}"
+      top_k: 5
+    save_as: blocking
+
+  # ========== Binder 调用分析 ==========
+  - id: binder_analysis
+    type: skill
+    name: "Binder 调用分析"
+    skill: binder_in_range
+    display:
+      level: key
+      layer: deep
+      title: "Binder 调用"
+      columns:
+        - name: client_process
+          label: "客户端"
+          type: string
+        - name: server_process
+          label: "服务端"
+          type: string
+        - name: call_count
+          label: "调用次数"
+          type: number
+          format: compact
+        - name: total_client_ms
+          label: "总耗时"
+          type: duration
+          format: duration_ms
+        - name: max_delay_ms
+          label: "最大延迟"
+          type: duration
+          format: duration_ms
+        - name: avg_delay_ms
+          label: "平均延迟"
+          type: duration
+          format: duration_ms
+        - name: slow_calls
+          label: "慢调用"
+          type: number
+    params:
+      start_ts: "${event_ts}"
+      end_ts: "${event_end_ts}"
+      package: "${process_name}"
+    save_as: binder_calls
+
+  # ========== 主线程同步 Binder 阻塞 ==========
+  - id: main_thread_sync_binder
+    type: skill
+    name: "主线程同步 Binder"
+    skill: binder_blocking_in_range
+    display:
+      level: key
+      layer: deep
+      title: "主线程同步 Binder"
+      columns:
+        - name: server_process
+          label: "对端进程"
+          type: string
+        - name: interface
+          label: "接口"
+          type: string
+        - name: call_count
+          label: "调用次数"
+          type: number
+        - name: total_block_ms
+          label: "总阻塞时间"
+          type: duration
+          format: duration_ms
+        - name: server_exec_ms
+          label: "服务端执行"
+          type: duration
+          format: duration_ms
+        - name: max_block_ms
+          label: "最大阻塞"
+          type: duration
+          format: duration_ms
+        - name: is_main_blocked
+          label: "主线程被阻"
+          type: boolean
+    params:
+      start_ts: "${event_ts}"
+      end_ts: "${event_end_ts}"
+      package: "${process_name}"
+    save_as: main_sync_binder
+
+  # ========== 主线程调度延迟 ==========
+  - id: sched_latency
+    type: skill
+    name: "调度延迟分析"
+    skill: main_thread_sched_latency_in_range
+    display:
+      level: detail
+      layer: deep
+      title: "主线程调度延迟"
+      columns:
+        - name: thread_name
+          label: "线程"
+          type: string
+        - name: runnable_count
+          label: "等待次数"
+          type: number
+        - name: total_runnable_ms
+          label: "总等待"
+          type: duration
+          format: duration_ms
+        - name: max_latency_ms
+          label: "最大延迟"
+          type: duration
+          format: duration_ms
+        - name: avg_latency_ms
+          label: "平均延迟"
+          type: duration
+          format: duration_ms
+        - name: long_wait_count
+          label: ">2ms 次数"
+          type: number
+        - name: severe_count
+          label: ">8ms 次数"
+          type: number
+    params:
+      start_ts: "${event_ts}"
+      end_ts: "${event_end_ts}"
+      package: "${process_name}"
+    save_as: sched_delay
+
+  # ========== 主线程文件 IO ==========
+  - id: main_thread_file_io
+    type: skill
+    name: "主线程文件 IO"
+    skill: main_thread_file_io_in_range
+    display:
+      level: detail
+      layer: deep
+      title: "主线程文件 IO"
+      columns:
+        - name: io_slice
+          label: "IO 切片"
+          type: string
+        - name: count
+          label: "次数"
+          type: number
+          format: compact
+        - name: total_ms
+          label: "总耗时"
+          type: duration
+          format: duration_ms
+        - name: avg_ms
+          label: "平均耗时"
+          type: duration
+          format: duration_ms
+        - name: max_ms
+          label: "最大耗时"
+          type: duration
+          format: duration_ms
+        - name: percent
+          label: "区间占比"
+          type: percentage
+          format: percentage
+    params:
+      start_ts: "${event_ts}"
+      end_ts: "${event_end_ts}"
+      package: "${process_name}"
+      min_dur_ns: 500000
+      top_k: 10
+    save_as: main_file_io
+
+  # ========== 慢点击诊断 ==========
+  - id: click_diagnosis
+    type: diagnostic
+    name: "慢点击诊断"
+    display:
+      level: key
+      layer: deep
+      title: "问题诊断"
+    inputs: [event_basic, cpu_core, quadrant, blocking, binder_calls, main_sync_binder, sched_delay, main_file_io]
+    rules:
+      # Runnable 等待过长（需由调度延迟指标佐证）
+      - condition: "quadrant.data[0]?.q3_runnable_ms > 20 && (sched_delay.data[0]?.severe_count || 0) > 0"
+        severity: warning
+        diagnosis: "主线程 Runnable 等待 ${quadrant.data[0].q3_runnable_ms}ms，且存在 ${sched_delay.data[0].severe_count} 次 >8ms 调度延迟"
+        confidence: high
+        suggestions:
+          - "CPU 资源争抢，检查后台线程负载"
+          - "减少并发任务"
+
+      # Sleeping 占比过高（需有 IO/Binder 阻塞佐证）
+      - condition: "quadrant.data[0]?.sleeping_pct > 50 && ((main_file_io.data[0]?.percent || 0) > 2 || ((main_sync_binder?.data?.find(r => r.is_main_blocked === 1)?.total_block_ms) || 0) > 15)"
+        severity: warning
+        diagnosis: "主线程 Sleeping 占比 ${quadrant.data[0].sleeping_pct}% 且存在 IO/Binder 阻塞证据"
+        confidence: medium
+        suggestions:
+          - "检查主线程阻塞原因"
+          - "将阻塞操作移到后台线程"
+
+      # 大核占比偏低 + Runnable 明显（仅在判定来源可信且有调度证据时触发）
+      - condition: "cpu_core.data[0]?.big_core_pct < 20 && cpu_core.data[0]?.total_running_ms > 20 && quadrant.data[0]?.q3_runnable_ms > 20 && (sched_delay.data[0]?.severe_count || 0) > 0 && !(cpu_core.data[0]?.classify_method || '').includes('cpu_id_fallback')"
+        severity: warning
+        diagnosis: "主线程大核占比偏低（${cpu_core.data[0].big_core_pct}%）且 Runnable 等待 ${quadrant.data[0].q3_runnable_ms}ms，存在调度供给不足迹象"
+        confidence: medium
+        suggestions:
+          - "检查是否有高优先级线程长期占用大核"
+          - "减少点击关键路径中的并发争抢"
+
+      # 核判定来源不可靠时，避免把大小核结论当根因
+      - condition: "(cpu_core.data[0]?.classify_method || '').includes('cpu_id_fallback')"
+        severity: info
+        diagnosis: "核类型判定回退到 CPU 编号阈值，大小核相关结论置信度有限"
+        confidence: medium
+        suggestions:
+          - "补充或检查 cpu_frequency/cpu capacity 数据后再判断大小核调度问题"
+
+      # 主线程文件 IO 偏高（需与阻塞态相互印证）
+      - condition: "(main_file_io.data[0]?.total_ms > 20 || main_file_io.data[0]?.percent > 5) && (quadrant.data[0]?.sleeping_pct || 0) > 20"
+        severity: warning
+        diagnosis: "主线程文件 IO '${main_file_io.data[0].io_slice}' 耗时 ${main_file_io.data[0].total_ms}ms（占比 ${main_file_io.data[0].percent}%）"
+        confidence: high
+        suggestions:
+          - "避免在点击关键路径执行同步文件读写"
+          - "将数据库/文件访问改为异步或延后"
+
+      # Binder 阻塞（需同步 Binder 阻塞证据）
+      - condition: "binder_calls.data[0]?.total_client_ms > 30 && ((main_sync_binder?.data?.find(r => r.is_main_blocked === 1)?.total_block_ms) || 0) > 10"
+        severity: warning
+        diagnosis: "Binder 调用 ${binder_calls.data[0].server_process} 耗时 ${binder_calls.data[0].total_client_ms}ms，且主线程同步 Binder 阻塞明显"
+        confidence: high
+        suggestions:
+          - "将 Binder 调用移到后台线程"
+          - "使用异步 Binder"
+
+output:
+  display:
+    level: key
+    format: summary

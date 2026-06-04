@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# Hardware Power Rails Energy Breakdown
+# =============================================================================
+# ODPM / PowerStats HAL backed rail measurements. This is hardware-measured
+# rail energy when android.power collect_power_rails was enabled and the device
+# exposes power rails.
+
+name: power_rails_energy_breakdown
+version: "1.0"
+type: atomic
+category: power
+tier: B
+
+meta:
+  display_name: "Power Rails 实测能耗分解"
+  description: "基于 android.power_rails 统计窗口内 rail 能耗、平均功率和数据来源等级"
+  icon: "battery_full"
+  tags: [power, rails, odpm, energy, measurement, atomic]
+
+triggers:
+  keywords:
+    zh: [power rails, rail 能耗, ODPM, 实测功耗, 子系统能耗]
+    en: [power rails, rail energy, ODPM, measured power, subsystem energy]
+  patterns:
+    - ".*(power rails|rail energy|ODPM).*"
+    - ".*(rail|子系统).*(能耗|功耗).*"
+
+prerequisites:
+  modules:
+    - android.power_rails
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+  - name: top_n
+    type: number
+    required: false
+    default: 30
+    description: "返回前 N 条 rail"
+
+steps:
+  - id: rail_energy
+    type: atomic
+    name: "Power Rail 实测能耗"
+    display:
+      level: summary
+      layer: list
+      title: "Power Rail 实测能耗"
+      columns:
+        - name: power_rail_name
+          label: "Rail"
+          type: string
+        - name: subsystem_name
+          label: "子系统"
+          type: string
+        - name: raw_power_rail_name
+          label: "Raw Rail"
+          type: string
+        - name: energy_uws
+          label: "能耗(uWs)"
+          type: number
+          format: compact
+        - name: energy_mwh
+          label: "能耗(mWh)"
+          type: number
+          format: compact
+        - name: avg_power_mw
+          label: "平均功率(mW)"
+          type: number
+          format: compact
+        - name: sample_coverage_pct
+          label: "采样覆盖(%)"
+          type: percentage
+        - name: source_level
+          label: "数据来源"
+          type: string
+    sql: |
+      WITH bounds AS (
+        SELECT
+          COALESCE(${start_ts}, trace_start()) AS start_ts,
+          COALESCE(${end_ts}, trace_end()) AS end_ts
+      ),
+      clipped AS (
+        SELECT
+          c.power_rail_name,
+          c.raw_power_rail_name,
+          COALESCE(m.subsystem_name, '') AS subsystem_name,
+          c.average_power,
+          MIN(c.ts + c.dur, b.end_ts) - MAX(c.ts, b.start_ts) AS clipped_dur
+        FROM android_power_rails_counters c
+        LEFT JOIN android_power_rails_metadata m USING (track_id)
+        CROSS JOIN bounds b
+        WHERE c.ts < b.end_ts
+          AND c.ts + c.dur > b.start_ts
+      ),
+      window AS (
+        SELECT MAX(end_ts - start_ts, 0) AS window_dur
+        FROM bounds
+      ),
+      energy AS (
+        SELECT
+          power_rail_name,
+          raw_power_rail_name,
+          subsystem_name,
+          SUM(average_power * clipped_dur / 1e6) AS energy_uws,
+          SUM(clipped_dur) AS covered_dur
+        FROM clipped
+        WHERE clipped_dur > 0
+        GROUP BY power_rail_name, raw_power_rail_name, subsystem_name
+      )
+      SELECT
+        power_rail_name,
+        subsystem_name,
+        raw_power_rail_name,
+        ROUND(energy_uws, 2) AS energy_uws,
+        ROUND(energy_uws / 3.6e9, 6) AS energy_mwh,
+        ROUND(energy_uws * 1e6 / NULLIF((SELECT window_dur FROM window), 0), 2) AS avg_power_mw,
+        ROUND(covered_dur * 100.0 / NULLIF((SELECT window_dur FROM window), 0), 2) AS sample_coverage_pct,
+        'hardware_power_rails' AS source_level
+      FROM energy
+      ORDER BY energy_uws DESC
+      LIMIT ${top_n|30}
+
+output:
+  format: structured

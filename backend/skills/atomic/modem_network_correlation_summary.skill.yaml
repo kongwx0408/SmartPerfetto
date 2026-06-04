@@ -1,0 +1,182 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# Modem Rail / Network Correlation Summary
+# =============================================================================
+# Correlates modem/cellular/radio rail energy with cellular network packet
+# activity. This is intentionally correlation, not exact per-app energy blame.
+
+name: modem_network_correlation_summary
+version: "1.0"
+type: atomic
+category: power
+tier: A
+
+meta:
+  display_name: "Modem Rail 与网络相关性"
+  description: "将 modem/cellular/radio rail 能耗与 android.network_packets 按包名/UID/socket_tag 相关联"
+  icon: "cell_tower"
+  tags: [power, modem, cellular, network, radio, correlation, atomic]
+
+prerequisites:
+  modules:
+    - android.power_rails
+    - android.network_packets
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+  - name: top_n
+    type: number
+    required: false
+    default: 20
+    description: "返回前 N 个网络来源"
+
+steps:
+  - id: modem_network_correlation
+    type: atomic
+    name: "Modem/网络相关性"
+    display:
+      level: detail
+      layer: list
+      title: "Modem Rail 与蜂窝网络相关性"
+      columns:
+        - name: package_name
+          label: "包名"
+          type: string
+        - name: socket_uid
+          label: "UID"
+          type: number
+        - name: socket_tag
+          label: "Socket Tag"
+          type: string
+        - name: packet_count
+          label: "包数"
+          type: number
+          format: compact
+        - name: bytes
+          label: "字节"
+          type: bytes
+        - name: cellular_uptime_sec
+          label: "估算蜂窝活跃(秒)"
+          type: number
+          format: compact
+        - name: modem_energy_mwh
+          label: "Modem rail 能耗(mWh)"
+          type: number
+          format: compact
+        - name: confidence
+          label: "置信度"
+          type: string
+    sql: |
+      WITH bounds AS (
+        SELECT
+          COALESCE(${start_ts}, trace_start()) AS start_ts,
+          COALESCE(${end_ts}, trace_end()) AS end_ts
+      ),
+      modem_rails AS (
+        SELECT
+          SUM(c.average_power * (
+            MIN(c.ts + c.dur, b.end_ts) - MAX(c.ts, b.start_ts)
+          ) / 1e6) AS energy_uws
+        FROM android_power_rails_counters c
+        LEFT JOIN android_power_rails_metadata m USING (track_id)
+        CROSS JOIN bounds b
+        WHERE c.ts < b.end_ts
+          AND c.ts + c.dur > b.start_ts
+          AND (
+            LOWER(COALESCE(c.power_rail_name, '')) GLOB '*modem*'
+            OR LOWER(COALESCE(c.power_rail_name, '')) GLOB '*cell*'
+            OR LOWER(COALESCE(c.power_rail_name, '')) GLOB '*radio*'
+            OR LOWER(COALESCE(c.raw_power_rail_name, '')) GLOB '*modem*'
+            OR LOWER(COALESCE(c.raw_power_rail_name, '')) GLOB '*cell*'
+            OR LOWER(COALESCE(c.raw_power_rail_name, '')) GLOB '*radio*'
+            OR LOWER(COALESCE(m.subsystem_name, '')) GLOB '*modem*'
+            OR LOWER(COALESCE(m.subsystem_name, '')) GLOB '*cell*'
+            OR LOWER(COALESCE(m.subsystem_name, '')) GLOB '*radio*'
+          )
+      ),
+      cellular_packets AS (
+        SELECT
+          package_name,
+          socket_uid,
+          socket_tag,
+          ts,
+          dur,
+          packet_count,
+          packet_length
+        FROM android_network_packets, bounds
+        WHERE ts >= start_ts
+          AND ts < end_ts
+          AND (
+            iface GLOB 'rmnet*'
+            OR iface GLOB 'ccmni*'
+            OR iface GLOB 'wwan*'
+            OR iface GLOB 'cell*'
+            OR LOWER(track_name) GLOB '*cell*'
+            OR LOWER(track_name) GLOB '*mobile*'
+            OR LOWER(track_name) GLOB '*modem*'
+          )
+      ),
+      uptime AS (
+        SELECT *
+        FROM android_network_uptime_spans!(
+          (
+            SELECT
+              package_name,
+              socket_uid,
+              socket_tag,
+              ts,
+              dur,
+              packet_count,
+              packet_length
+            FROM cellular_packets
+          ),
+          (package_name, socket_uid, socket_tag),
+          10000000000
+        )
+      ),
+      ranked AS (
+        SELECT
+          package_name,
+          socket_uid,
+          socket_tag,
+          SUM(packet_count) AS packet_count,
+          SUM(packet_length) AS bytes,
+          ROUND(SUM(dur) / 1e9, 2) AS cellular_uptime_sec,
+          ROUND((SELECT energy_uws FROM modem_rails) / 3.6e9, 6) AS modem_energy_mwh,
+          CASE
+            WHEN COALESCE((SELECT energy_uws FROM modem_rails), 0) > 0 THEN 'correlation_only_with_modem_rail'
+            ELSE 'network_only_no_modem_rail'
+          END AS confidence
+        FROM uptime
+        GROUP BY package_name, socket_uid, socket_tag
+        ORDER BY bytes DESC
+        LIMIT ${top_n|20}
+      )
+      SELECT * FROM ranked
+      UNION ALL
+      SELECT
+        '' AS package_name,
+        NULL AS socket_uid,
+        '' AS socket_tag,
+        0 AS packet_count,
+        0 AS bytes,
+        0 AS cellular_uptime_sec,
+        ROUND((SELECT energy_uws FROM modem_rails) / 3.6e9, 6) AS modem_energy_mwh,
+        CASE
+          WHEN COALESCE((SELECT energy_uws FROM modem_rails), 0) > 0 THEN 'modem_rail_without_cellular_packets'
+          ELSE 'insufficient_modem_and_cellular_data'
+        END AS confidence
+      WHERE NOT EXISTS (SELECT 1 FROM ranked)
+
+output:
+  format: structured

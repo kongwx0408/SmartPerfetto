@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# Wattson App Startup 窗口功耗（B 级 atomic）
+# =============================================================================
+# 使用 wattson.windows 的 wattson_window_app_startup 表，针对每次应用启动
+# 窗口给出总能耗（mWs）。可与 startup_analysis 联动定位"启动期耗电特别高"
+# 的应用。
+
+name: wattson_app_startup_power
+version: "1.0"
+type: atomic
+category: power
+tier: B
+
+meta:
+  display_name: "应用启动期能耗"
+  description: "每次应用启动期间的总能耗（mWs）"
+  icon: "rocket_launch"
+  tags: [power, wattson, startup, energy, atomic]
+
+prerequisites:
+  modules:
+    - wattson.windows
+    - wattson.aggregation
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "应用包名 GLOB（可选）"
+
+steps:
+  - id: startup_power
+    type: atomic
+    name: "启动期能耗列表"
+    display:
+      level: detail
+      layer: list
+      title: "应用启动能耗"
+      columns:
+        - name: package
+          label: "包名"
+          type: string
+        - name: window_ts
+          label: "起始时间"
+          type: timestamp
+        - name: dur_ms
+          label: "启动时长(ms)"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: total_energy_mws
+          label: "总能耗(mWs)"
+          type: number
+          format: compact
+        - name: energy_mwh
+          label: "能耗(mWh)"
+          type: number
+          format: compact
+        - name: source_level
+          label: "数据来源"
+          type: string
+    sql: |
+      WITH startup_windows AS (
+        SELECT ts, dur, period_id
+        FROM wattson_window_app_startup
+      ),
+      startup_energy AS (
+        SELECT
+          period_id,
+          SUM(total_mws) AS total_energy_mws
+        FROM wattson_threads_aggregation!(startup_windows)
+        GROUP BY period_id
+      )
+      SELECT
+        s.package,
+        w.ts AS window_ts,
+        ROUND(w.dur / 1e6, 1) AS dur_ms,
+        ROUND(COALESCE(e.total_energy_mws, 0), 2) AS total_energy_mws,
+        ROUND(COALESCE(e.total_energy_mws, 0) / 3600.0, 6) AS energy_mwh,
+        'wattson_thread_estimate' AS source_level
+      FROM startup_windows AS w
+      JOIN android_startups AS s
+        ON s.startup_id = w.period_id
+      LEFT JOIN startup_energy AS e
+        ON e.period_id = w.period_id
+      WHERE (s.package GLOB '${package}*' OR '${package}' = '')
+      ORDER BY w.ts ASC

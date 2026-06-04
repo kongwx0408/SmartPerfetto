@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# JobScheduler 任务事件（B 级 atomic）
+# =============================================================================
+# 使用 android.job_scheduler 模块列出 JobScheduler 调度的后台任务。
+# 后台任务排期不当是续航问题的第一阶高频根因。
+
+name: android_job_scheduler_events
+version: "1.0"
+type: atomic
+category: background
+tier: B
+
+meta:
+  display_name: "JobScheduler 事件"
+  description: "JobScheduler 后台任务执行序列"
+  icon: "schedule"
+  tags: [job_scheduler, background, lifecycle, atomic]
+
+prerequisites:
+  modules:
+    - android.job_scheduler
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "目标包名 GLOB（可选）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+steps:
+  - id: job_events
+    type: atomic
+    name: "Job 事件列表"
+    display:
+      level: detail
+      layer: list
+      title: "JobScheduler 任务"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+        - name: dur_ms
+          label: "耗时(ms)"
+          type: duration
+          format: duration_ms
+        - name: job_name
+          label: "任务名"
+          type: string
+        - name: package_name
+          label: "包名"
+          type: string
+        - name: uid
+          label: "UID"
+          type: number
+    sql: |
+      SELECT
+        ts,
+        ROUND(dur / 1e6, 2) AS dur_ms,
+        job_service_name AS job_name,
+        package_name,
+        uid
+      FROM android_job_scheduler_events
+      WHERE (package_name GLOB '${package}*' OR '${package}' = '')
+        AND (${start_ts} IS NULL OR ts + dur > ${start_ts})
+        AND (${end_ts} IS NULL OR ts < ${end_ts})
+      ORDER BY ts ASC

@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# CPU Frequency Residency Summary
+# =============================================================================
+# Window-level frequency residency by cluster type. Designed for power analysis:
+# high-frequency residency is more useful than point-in-time frequency averages.
+
+name: cpu_freq_residency_summary
+version: "1.0"
+type: atomic
+category: power
+tier: B
+
+meta:
+  display_name: "CPU 高频驻留摘要"
+  description: "按大小核/频点桶统计窗口内 CPU 频率驻留和高频占比"
+  icon: "speed"
+  tags: [cpu, frequency, residency, power, dvfs, atomic]
+
+prerequisites:
+  modules:
+    - linux.cpu.frequency
+    - android.cpu.cluster_type
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+steps:
+  - id: freq_residency
+    type: atomic
+    name: "CPU 频率驻留"
+    display:
+      level: summary
+      layer: list
+      title: "CPU 高频驻留"
+      columns:
+        - name: cluster_type
+          label: "Cluster"
+          type: string
+        - name: cpu_count
+          label: "CPU 数"
+          type: number
+        - name: total_residency_sec
+          label: "总驻留(秒)"
+          type: number
+          format: compact
+        - name: high_freq_residency_sec
+          label: "高频驻留(秒)"
+          type: number
+          format: compact
+        - name: high_freq_ratio_pct
+          label: "高频占比(%)"
+          type: percentage
+        - name: weighted_avg_freq_mhz
+          label: "加权平均频率(MHz)"
+          type: number
+          format: compact
+        - name: max_freq_mhz
+          label: "最高频率(MHz)"
+          type: number
+          format: compact
+    sql: |
+      WITH clipped AS (
+        SELECT
+          f.cpu,
+          COALESCE(m.cluster_type, 'unknown') AS cluster_type,
+          f.freq,
+          MIN(f.ts + f.dur, COALESCE(${end_ts}, trace_end())) -
+            MAX(f.ts, COALESCE(${start_ts}, trace_start())) AS clipped_dur
+        FROM cpu_frequency_counters f
+        LEFT JOIN android_cpu_cluster_mapping m USING (cpu)
+        WHERE f.ts < COALESCE(${end_ts}, trace_end())
+          AND f.ts + f.dur > COALESCE(${start_ts}, trace_start())
+      ),
+      cpu_max AS (
+        SELECT cpu, MAX(freq) AS max_freq
+        FROM clipped
+        WHERE clipped_dur > 0
+        GROUP BY cpu
+      )
+      SELECT
+        cluster_type,
+        COUNT(DISTINCT cpu) AS cpu_count,
+        ROUND(SUM(clipped_dur) / 1e9, 2) AS total_residency_sec,
+        ROUND(SUM(CASE WHEN freq >= max_freq * 0.8 THEN clipped_dur ELSE 0 END) / 1e9, 2) AS high_freq_residency_sec,
+        ROUND(SUM(CASE WHEN freq >= max_freq * 0.8 THEN clipped_dur ELSE 0 END) * 100.0 / NULLIF(SUM(clipped_dur), 0), 2) AS high_freq_ratio_pct,
+        ROUND(SUM(freq * clipped_dur) / NULLIF(SUM(clipped_dur), 0) / 1000.0, 0) AS weighted_avg_freq_mhz,
+        ROUND(MAX(max_freq) / 1000.0, 0) AS max_freq_mhz
+      FROM clipped
+      JOIN cpu_max USING (cpu)
+      WHERE clipped_dur > 0
+      GROUP BY cluster_type
+      ORDER BY high_freq_ratio_pct DESC
+
+output:
+  format: structured

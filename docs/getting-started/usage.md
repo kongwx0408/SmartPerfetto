@@ -1,0 +1,85 @@
+# 基本使用
+
+[English](usage.en.md) | [中文](usage.md)
+
+如果你想先了解 SmartPerfetto 的完整功能边界、入口和输出效果，见 [功能总览](features.md)。
+
+## 推荐 trace 内容
+
+SmartPerfetto 最适合 Android 12+ trace，尤其是包含 FrameTimeline 数据的 trace。常用 atrace category：
+
+| 场景 | 最低 category | 建议额外添加 |
+|---|---|---|
+| 滑动 | `gfx`, `view`, `input`, `sched` | `binder_driver`, `freq`, `disk` |
+| 启动 | `am`, `dalvik`, `wm`, `sched` | `binder_driver`, `freq`, `disk` |
+| ANR | `am`, `wm`, `sched`, `binder_driver` | `dalvik`, `disk` |
+| GPU/渲染 | `gfx`, `view`, `sched` | `freq`, `gpu`, `binder_driver` |
+
+## UI 分析流程
+
+1. 打开 `http://localhost:10000`。
+2. 加载 `.pftrace` 或 `.perfetto-trace`。
+3. 打开 SmartPerfetto AI Assistant 面板。
+4. 选择分析模式：快速、完整或智能。
+5. 输入自然语言问题。
+6. 等待 SSE 流式输出、表格证据和最终结论。
+
+智能模式会先返回“场景盘点”，按时间顺序列出 trace 中识别到的启动、滑动、点击、导航、设备状态、ANR 等场景，并显示可深钻的范围按钮。选择“全部”或某一类场景后，才会进入对应的启动/滑动/点击等深钻分析。
+
+## 常见问题模板
+
+```text
+分析滑动卡顿
+分析启动性能
+帮我看看这个 ANR
+这个 trace 的应用包名和主要进程是什么？
+这段选区里主线程为什么卡住？
+对比当前 trace 和参考 trace 的滑动差异
+对比一下另外一份
+对比 AR-1234abcd
+```
+
+## 多 Trace 分析结果对比
+
+如果你已经在两个或更多 Trace 上完成 AI 分析，可以直接在 AI 输入框里说 `对比一下另外一份`。当当前窗口有最新分析结果，并且同一 workspace 里只有一个明确的其他候选结果时，SmartPerfetto 会自动用当前结果作为基线并发起对比。
+
+每份 AI 分析完成后，结果标题旁会显示 `Result ID`，例如 `AR-1234abcd`。如果候选不止一份，或者你想指定对象，可以说 `对比 AR-1234abcd`，也可以说 `对比 AR-11111111 和 AR-22222222`。多个 ID 同时出现时，第一个 ID 会作为基线，后面的 ID 会作为候选。
+
+你也可以用 AI Assistant 顶部的 `fact_check` 入口打开“分析结果对比”。选择一个 `基线` 和一个或多个 `候选` 后，SmartPerfetto 会生成标准指标 delta、显著变化摘要和 HTML 对比报告。
+
+这个功能对比的是已完成分析结果，不要求另一个 Perfetto UI 窗口继续打开。完整操作说明见 [多 Trace 分析结果对比](multi-trace-result-comparison.md)。
+
+## 分析模式选择
+
+| 模式 | 推荐问题 | 不适合的问题 |
+|---|---|---|
+| 快速 | 包名、进程、trace 概览、简单数值 | `分析启动性能`、`分析滑动卡顿` 这类重查询 |
+| 完整 | 启动、滑动、ANR、复杂渲染根因 | 只问一个简单事实时成本偏高 |
+| 智能 | 混合脚本 trace、需要先看场景再决定深钻范围 | 明确只想直接分析单一场景时不如选择完整模式加具体问题 |
+
+fast 模式默认 10 turns。重型 Skill 可能返回较大的 JSON，仍可能耗尽 turns；复杂性能分析建议直接使用 full。
+
+## 选区与追问
+
+前端会把 area selection 或 track event selection 作为 `selectionContext` 传给后端。适合这样问：
+
+```text
+只看我选中的这段时间，为什么 UI thread 变慢？
+这个 slice 前后有没有 Binder 或调度问题？
+```
+
+多轮追问会复用 session。切换 fast/full/auto 模式会开启新的 SDK session，避免轻量上下文和完整上下文混用。
+
+## 输出怎么看
+
+SmartPerfetto 的回答通常包含三类证据：
+
+- SQL 结果：直接来自 `trace_processor_shell`。
+- Skill 结果：来自 `backend/skills/` 的 YAML 分析流水线，按 L1-L4 分层展示。
+- Agent 结论：LLM 基于 SQL、Skill、策略和 verifier 输出的中文解释。
+
+结论应该能追溯到表格、时间段、线程、slice 或 Skill 结果。无法被 trace 数据支撑的建议，不应作为确定结论。
+
+## 生成报告
+
+agent 分析完成后，后端会生成 HTML report。UI 使用 `/api/agent/v1/:sessionId/report` 读取报告地址；通用报告接口位于 `/api/reports/:reportId`。

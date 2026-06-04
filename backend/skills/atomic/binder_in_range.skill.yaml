@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# Binder 延迟分析（原子 Skill）
+# =============================================================================
+# 分析指定时间范围内的 Binder 调用
+
+name: binder_in_range
+version: "1.0"
+type: atomic
+category: kernel
+tier: B
+
+meta:
+  display_name: "Binder 事务分析 (区间)"
+  description: "分析指定时间范围内的 Binder 事务"
+  icon: "link"
+  tags: [binder, transaction, kernel, atomic]
+
+prerequisites:
+  required_tables:
+    - slice
+  modules:
+    - android.binder
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns，可选)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns，可选)"
+  - name: package
+    type: string
+    required: false
+
+display:
+  level: detail
+  format: table
+  columns:
+    - name: client_process
+      label: "客户端"
+      type: string
+    - name: server_process
+      label: "服务端"
+      type: string
+    - name: call_count
+      label: "调用次数"
+      type: number
+      format: compact
+    - name: total_client_ms
+      label: "总耗时"
+      type: duration
+      format: duration_ms
+    - name: max_delay_ms
+      label: "最大延迟"
+      type: duration
+      format: duration_ms
+    - name: avg_delay_ms
+      label: "平均延迟"
+      type: duration
+      format: duration_ms
+    - name: slow_calls
+      label: "慢调用"
+      type: number
+
+sql: |
+  SELECT
+    client_process,
+    server_process,
+    COUNT(*) as call_count,
+    SUM(client_dur) / 1e6 as total_client_ms,
+    MAX(client_dur) / 1e6 as max_delay_ms,
+    AVG(client_dur) / 1e6 as avg_delay_ms,
+    SUM(CASE WHEN client_dur > 10000000 THEN 1 ELSE 0 END) as slow_calls
+  FROM android_binder_txns
+  WHERE (${start_ts} IS NULL OR client_ts >= ${start_ts})
+    AND (${end_ts} IS NULL OR client_ts < ${end_ts})
+    AND (client_process GLOB '${package}*' OR '${package}' = '')
+  GROUP BY client_process, server_process
+  HAVING total_client_ms > 1
+  ORDER BY total_client_ms DESC

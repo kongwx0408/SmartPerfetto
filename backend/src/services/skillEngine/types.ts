@@ -1,0 +1,775 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Gracker (Chris)
+// This file is part of SmartPerfetto. See LICENSE for details.
+
+/**
+ * Skill Engine Type Definitions
+ *
+ * 支持：
+ * - Skill 可组合（composite）
+ * - Skill 可迭代（iterator）
+ * - AI 协作（ai_decision, ai_summary）
+ * - 诊断推理（diagnostic）
+ * - 展示控制（display）
+ */
+
+import type { ColumnDefinition } from '../../types/dataContract';
+import type { IdentityResolutionV1 } from '../../types/identityContract';
+
+// =============================================================================
+// 基础类型
+// =============================================================================
+
+export type SkillType =
+  | 'atomic'
+  | 'composite'
+  | 'iterator'
+  | 'diagnostic'
+  | 'ai_decision'
+  | 'ai_summary'
+  | 'conditional'
+  | 'pipeline'
+  | 'pipeline_definition'
+  | 'comparison';
+
+export type DisplayLevel = 'none' | 'debug' | 'detail' | 'summary' | 'key' | 'hidden';
+
+export type DisplayFormat = 'table' | 'chart' | 'text' | 'timeline' | 'summary' | 'metric';
+
+/**
+ * Display Layer - 控制结果在 UI 中的层级展示
+ *
+ * 语义说明：
+ * - overview: 顶层概览指标（如 FPS、掉帧率）
+ * - list: 列表级数据（如滑动会话列表、启动事件列表）
+ * - session: 会话级详情（如单个滑动会话的详细数据）
+ * - deep: 深度分析数据（如帧级分析、调用栈）
+ * - diagnosis: 诊断结论与根因证据
+ */
+export type DisplayLayer = 'overview' | 'list' | 'session' | 'deep' | 'diagnosis';
+
+export type ConfidenceLevel = 'high' | 'medium' | 'low';
+
+// =============================================================================
+// Synthesize (v2.0) - Deterministic Insight Summary
+// =============================================================================
+
+/**
+ * Synthesize 配置 - 定义步骤数据如何贡献到最终摘要（洞见摘要）
+ *
+ * 支持两种形式：
+ * - synthesize: true（旧版：仅标记该步骤参与摘要）
+ * - synthesize: { role, fields, ... }（新版：数据驱动摘要）
+ */
+export interface SynthesizeConfig {
+  /** 数据角色: overview(概览指标), list(列表统计), clusters(聚类分析), conclusion(结论) */
+  role: 'overview' | 'list' | 'clusters' | 'conclusion';
+  /** 字段映射 - 定义如何从数据中提取指标 */
+  fields?: Array<{
+    /** 源字段名 */
+    key: string;
+    /** 显示标签 */
+    label: string;
+    /** 格式化模板，支持 {{field}} 插值 */
+    format?: string;
+  }>;
+  /** 分组统计配置 - 用于 list 角色 */
+  groupBy?: Array<{
+    /** 分组字段名 */
+    field: string;
+    /** 分组标题 */
+    title: string;
+  }>;
+  /** 聚类配置 - 用于 clusters 角色 */
+  clusterBy?: string | { field: string; label?: string };
+  /** 洞察条件 - 自动生成的分析结论 */
+  insights?: Array<{
+    /** 条件表达式，如 "jank_rate > 10" */
+    condition?: string;
+    /** 洞察模板，支持 {{field}} 插值 */
+    template: string;
+  }>;
+}
+
+// =============================================================================
+// 输入/输出定义
+// =============================================================================
+
+export interface SkillInput {
+  name: string;
+  type: 'string' | 'number' | 'integer' | 'boolean' | 'timestamp' | 'duration' | 'array' | 'object';
+  required: boolean;
+  default?: any;
+  description?: string;
+}
+
+export interface SkillOutput {
+  name: string;
+  type: 'string' | 'number' | 'integer' | 'boolean' | 'timestamp' | 'duration' | 'array' | 'object';
+  description?: string;
+}
+
+// =============================================================================
+// Input Validation Types
+// =============================================================================
+
+export interface SkillInputValidationError {
+  paramName: string;
+  message: string;
+  severity: 'error' | 'warning';
+}
+
+export interface ValidatedParams {
+  params: Record<string, any>;
+  errors: SkillInputValidationError[];
+  warnings: SkillInputValidationError[];
+}
+
+// =============================================================================
+// 展示控制
+// =============================================================================
+
+export interface DisplayConfig {
+  show?: boolean;
+  level?: DisplayLevel;
+  layer?: DisplayLayer;         // 分层展示层级
+  title?: string;
+  format?: DisplayFormat;
+  columns?: Array<string | Partial<ColumnDefinition>>; // 指定展示哪些列（支持简写或完整列定义）
+  aggregate?: boolean;          // 是否汇总迭代结果
+  highlight?: HighlightRule[];  // 高亮规则
+  expandable?: boolean;         // 是否支持展开查看详细分析（用于 L2 列表关联 L4 deep 数据）
+  expandableBindSource?: string; // save_as 名，将该步骤的行数据绑定为当前步骤的 expandableData（批量绑定，替代 iterator）
+  metadataFields?: string[];    // 提取到元数据的字段（这些字段从列表移到标题显示）
+  hidden_columns?: string[];    // 隐藏的列（保留数据但不显示）
+  collapsible?: boolean;        // 是否可折叠（点击展开/收起整个表格）
+  defaultCollapsed?: boolean;   // 是否默认折叠
+}
+
+export interface HighlightRule {
+  condition: string;  // 表达式，如 "diagnosis == 'CPU密集'"
+  color?: string;
+  icon?: string;
+}
+
+// =============================================================================
+// 诊断规则
+// =============================================================================
+
+export interface DiagnosticRule {
+  condition: string;          // 条件表达式
+  diagnosis: string;          // 诊断结论
+  confidence: number | ConfidenceLevel;  // 置信度
+  severity?: 'info' | 'warning' | 'critical'; // 显式严重程度（可选）
+  suggestions?: string[];     // 优化建议
+  evidence_fields?: string[]; // 证据字段
+}
+
+export interface DiagnosticFallback {
+  type: 'ai_decision';
+  prompt: string;
+}
+
+// =============================================================================
+// Step 类型
+// =============================================================================
+
+/**
+ * 原子步骤 - 执行单个 SQL
+ */
+export interface AtomicStep {
+  id: string;
+  type: 'atomic';
+  name?: string;
+  description?: string;
+  sql: string;
+  /** SQL fragment paths relative to skills/ (e.g., ['fragments/target_threads.sql']) */
+  sql_fragments?: string[];
+  display?: DisplayConfig | boolean;
+  save_as?: string;
+  optional?: boolean;
+  on_empty?: string;
+  condition?: string;  // 执行条件，不满足时跳过此步骤
+  synthesize?: boolean | SynthesizeConfig; // 标记/配置此步骤用于最终总结
+}
+
+/**
+ * Skill 引用步骤 - 调用另一个 skill
+ */
+export interface SkillRefStep {
+  id: string;
+  type?: 'skill';  // 默认类型
+  skill: string;   // 引用的 skill id
+  name?: string;
+  params?: Record<string, any>;  // 传递给子 skill 的参数
+  display?: DisplayConfig | boolean;
+  save_as?: string;
+  synthesize?: boolean | SynthesizeConfig;
+}
+
+/**
+ * 迭代步骤 - 对每个元素执行 skill
+ */
+export interface IteratorStep {
+  id: string;
+  type: 'iterator';
+  name?: string;
+  source: string;       // 数据源（之前步骤的 save_as）
+  item_skill: string;   // 对每个元素执行的 skill
+  item_params?: Record<string, string>;  // 从 item 映射到 skill 参数
+  display?: DisplayConfig | boolean;
+  save_as?: string;
+  max_items?: number;   // 最大迭代数量（性能保护）
+  synthesize?: boolean | SynthesizeConfig; // 标记/配置此步骤用于最终总结
+}
+
+/**
+ * 并行步骤 - 并行执行多个步骤
+ */
+export interface ParallelStep {
+  id: string;
+  type: 'parallel';
+  name?: string;
+  steps: (AtomicStep | SkillRefStep)[];
+  display?: DisplayConfig | boolean;
+  save_as?: string;
+  synthesize?: boolean | SynthesizeConfig;
+}
+
+/**
+ * 诊断步骤 - 根据规则推理
+ */
+export interface DiagnosticStep {
+  id: string;
+  type: 'diagnostic';
+  name?: string;
+  inputs: string[];           // 输入数据源
+  rules: DiagnosticRule[];    // 诊断规则
+  ai_assist?: boolean;        // 是否让 AI 参与
+  fallback?: DiagnosticFallback;  // 规则无法确定时的回退
+  display?: DisplayConfig | boolean;
+  save_as?: string;
+  synthesize?: boolean | SynthesizeConfig;
+}
+
+/**
+ * AI 决策步骤 - 让 AI 做出判断
+ */
+export interface AIDecisionStep {
+  id: string;
+  type: 'ai_decision';
+  name?: string;
+  prompt: string;             // 提示词模板
+  inputs?: string[];          // 输入数据源
+  output_schema?: Record<string, any>;  // 期望的输出结构
+  display?: DisplayConfig | boolean;
+  save_as?: string;
+  synthesize?: boolean | SynthesizeConfig;
+}
+
+/**
+ * AI 总结步骤 - 让 AI 生成总结
+ */
+export interface AISummaryStep {
+  id: string;
+  type: 'ai_summary';
+  name?: string;
+  prompt: string;
+  inputs?: string[];
+  display?: DisplayConfig | boolean;
+  save_as?: string;
+  synthesize?: boolean | SynthesizeConfig;
+}
+
+/**
+ * 条件步骤 - 根据条件选择执行
+ */
+export interface ConditionalStep {
+  id: string;
+  type: 'conditional';
+  name?: string;
+  conditions: {
+    when: string;             // 条件表达式
+    then: string | SkillStep; // skill id 或内联步骤
+  }[];
+  else?: string | SkillStep;  // 默认分支
+  display?: DisplayConfig | boolean;
+  save_as?: string;
+  synthesize?: boolean | SynthesizeConfig;
+}
+
+/**
+ * Pipeline 步骤 - 聚合渲染管线教学内容与 Pin 指令
+ *
+ * 设计目标：
+ * - 将 pipeline 教学链路从路由层收敛到 SkillEngine 步骤执行
+ * - 输入来源可配置（默认读取渲染管线检测技能的 save_as 结果）
+ */
+export interface PipelineStep {
+  id: string;
+  type: 'pipeline';
+  name?: string;
+  /** 可选：显式指定 pipeline id（支持 ${...} 模板） */
+  pipeline_id?: string;
+  /** 检测结果来源（默认: pipeline_result） */
+  pipeline_source?: string;
+  /** 活跃渲染进程来源（默认: active_rendering_processes） */
+  active_processes_source?: string;
+  /** Trace 采集缺失项来源（默认: trace_requirements） */
+  trace_requirements_source?: string;
+  display?: DisplayConfig | boolean;
+  save_as?: string;
+  synthesize?: boolean | SynthesizeConfig;
+}
+
+// 所有步骤类型的联合
+export type SkillStep =
+  | AtomicStep
+  | SkillRefStep
+  | IteratorStep
+  | ParallelStep
+  | DiagnosticStep
+  | AIDecisionStep
+  | AISummaryStep
+  | ConditionalStep
+  | PipelineStep;
+
+// =============================================================================
+// Skill 定义
+// =============================================================================
+
+export interface SkillMeta {
+  display_name: string;
+  description: string;
+  icon?: string;
+  tags?: string[];
+  author?: string;
+  version?: string;
+}
+
+export interface SkillTriggers {
+  keywords?: {
+    zh?: string[];
+    en?: string[];
+  } | string[];
+  patterns?: string[];
+  // 自动触发条件（基于 trace 内容）
+  auto_detect?: {
+    required_tables?: string[];
+    conditions?: string[];
+  };
+}
+
+export interface SkillIdentityConfig {
+  policy: 'none' | 'exempt' | 'verify_if_present' | 'required';
+  scope?: 'process';
+  aliases?: string[];
+  rewriteTo?: 'recommended_process_name_param' | 'upid';
+  minConfidence?: number;
+}
+
+export interface SkillPrerequisites {
+  required_tables?: string[];
+  optional_tables?: string[];
+  modules?: string[];
+}
+
+export interface SkillOutputConfig {
+  display?: DisplayConfig;
+  fields?: {
+    name: string;
+    label?: string;
+    type?: string;
+  }[];
+}
+
+export type SkillSource = 'trace' | 'analysis_result_snapshot';
+
+export interface ComparisonSkillConfig {
+  operation: 'build_comparison_matrix';
+  source: 'analysis_result_snapshot';
+  supports_backfill?: boolean;
+  required_inputs?: string[];
+  output_contract?: 'ComparisonMatrix';
+}
+
+export interface SkillDefinition {
+  name: string;
+  version: string;
+  type: SkillType;           // 'atomic' | 'composite' | 'iterator' | 'diagnostic' | 'comparison'
+  category?: string;
+  priority?: string;
+
+  meta: SkillMeta;
+  triggers?: SkillTriggers;
+  prerequisites?: SkillPrerequisites;
+  identity?: SkillIdentityConfig;
+
+  // 输入参数
+  inputs?: SkillInput[];
+
+  // 上下文依赖（从父 skill 继承）
+  context?: string[];
+
+  // 执行步骤（composite/iterator/diagnostic 使用）
+  steps?: SkillStep[];
+
+  // 原子 skill 的 SQL（atomic 使用）
+  sql?: string;
+
+  // 数据来源。默认 trace；comparison skills 使用 analysis_result_snapshot。
+  source?: SkillSource;
+
+  // Comparison skills are metadata contracts executed by comparison services,
+  // not by the single-trace SQL SkillExecutor.
+  comparison?: ComparisonSkillConfig;
+
+  // 诊断规则（diagnostic 使用）
+  rules?: DiagnosticRule[];
+
+  // 输出配置
+  output?: SkillOutputConfig;
+
+  // 阈值定义（用于诊断）
+  thresholds?: Record<string, {
+    unit?: string;
+    levels: Record<string, { min?: number; max?: number; label?: string }>;
+  }>;
+
+  // ==========================================================================
+  // Module Expert System fields (Phase 1 - Cross-Domain Expert System)
+  // ==========================================================================
+
+  /**
+   * Module metadata - identifies this skill as a module expert
+   * When present, this skill can be invoked by cross-domain experts
+   */
+  module?: ModuleMetadata;
+
+  /**
+   * Dialogue interface - how cross-domain experts interact with this module
+   * Defines capabilities (questions it can answer), findings schemas, and suggestions
+   */
+  dialogue?: DialogueInterface;
+}
+
+// =============================================================================
+// 执行上下文
+// =============================================================================
+
+export interface SkillExecutionContext {
+  traceId: string;
+  packageName?: string;
+  vendor?: string;
+  // 当前 skill 解析后的 prerequisite modules（用于每个 SQL 步骤内自动 INCLUDE）
+  moduleIncludes?: string[];
+
+  // 当前 skill 的输入参数
+  params: Record<string, any>;
+
+  // 从父 skill 继承的上下文
+  inherited: Record<string, any>;
+
+  // 各步骤的执行结果
+  results: Record<string, StepResult>;
+
+  // 保存的变量（save_as）
+  variables: Record<string, any>;
+
+  // 当前迭代项（iterator 中使用）
+  currentItem?: any;
+  currentItemIndex?: number;
+}
+
+export interface StepResult {
+  stepId: string;
+  stepType: SkillType | 'skill' | 'parallel';
+  success: boolean;
+  data?: any;
+  error?: string;
+  executionTimeMs: number;
+  display?: DisplayConfig;
+}
+
+// =============================================================================
+// 执行结果
+// =============================================================================
+
+export interface SkillExecutionResult {
+  skillId: string;
+  skillName: string;
+  success: boolean;
+
+  // 需要展示的结果（按 display 配置过滤）
+  displayResults: DisplayResult[];
+
+  // 诊断结论
+  diagnostics: DiagnosticResult[];
+
+  // AI 生成的总结
+  aiSummary?: string;
+
+  /**
+   * Data marked via YAML step-level `synthesize:` for downstream summarization.
+   * Optional and best-effort; callers should treat it as advisory.
+   */
+  synthesizeData?: any[];
+
+  // 原始结果（用于调试）
+  rawResults?: Record<string, StepResult>;
+
+  // Identity Contract sidecar produced by the process/thread identity gate.
+  identityResolution?: IdentityResolutionV1;
+
+  executionTimeMs: number;
+  error?: string;
+}
+
+export interface DisplayResult {
+  stepId: string;
+  title: string;
+  level: DisplayLevel;
+  layer?: DisplayLayer;         // 分层展示层级
+  format: DisplayFormat;
+  data: {
+    columns?: string[];
+    rows?: any[][];
+    text?: string;
+    chart?: any;
+    // 可展开行数据：每行的详细内容（用于 iterator 类型的结果展示）
+    expandableData?: Array<{
+      // 原始 item 数据
+      item: Record<string, any>;
+      // 详细分析结果（包含所有子步骤的结果）
+      result: {
+        success: boolean;
+        sections?: Record<string, any>;
+        error?: string;
+      };
+    }>;
+    // 汇总报告（用于 iterator 结果的整体分析）
+    summary?: {
+      title: string;
+      content: string;
+      metrics?: Array<{
+        label: string;
+        value: string | number;
+        unit?: string;
+        severity?: 'info' | 'warning' | 'critical';
+      }>;
+    };
+  };
+  highlight?: HighlightRule[];
+  /** 原始 SQL 查询（用于 HTML 报告生成） */
+  sql?: string;
+  /** 是否支持展开查看详细分析（用于 L2 列表关联 L4 deep 数据） */
+  expandable?: boolean;
+  /** 提取到元数据的字段（这些字段从列表移到标题显示） */
+  metadataFields?: string[];
+  /** 隐藏的列（保留数据但不显示） */
+  hidden_columns?: string[];
+  /** 是否可折叠（点击展开/收起整个表格） */
+  collapsible?: boolean;
+  /** 是否默认折叠 */
+  defaultCollapsed?: boolean;
+  /** 完整的列定义（包含 type, format, hidden, clickAction 等） */
+  columnDefinitions?: Array<{
+    name: string;
+    label?: string;
+    type?: string;
+    format?: string;
+    hidden?: boolean;
+    clickAction?: string;
+    durationColumn?: string;
+    unit?: string;
+    width?: string | number;
+    tooltip?: string;
+    enumValues?: string[];
+    sortable?: boolean;
+    defaultSort?: 'asc' | 'desc';
+  }>;
+}
+
+export interface DiagnosticResult {
+  id: string;
+  diagnosis: string;
+  confidence: number;
+  severity: 'info' | 'warning' | 'critical';
+  evidence?: Record<string, any>;
+  suggestions?: string[];
+  source: 'rule' | 'ai';
+}
+
+// =============================================================================
+// 事件（用于前端实时展示）
+// =============================================================================
+
+export type SkillEventType =
+  | 'skill_started'
+  | 'step_started'
+  | 'step_completed'
+  | 'display_result'
+  | 'diagnostic_found'
+  | 'ai_thinking'
+  | 'ai_response'
+  | 'skill_completed'
+  | 'skill_error';
+
+export interface SkillEvent {
+  type: SkillEventType;
+  timestamp: number;
+  skillId: string;
+  stepId?: string;
+  data?: any;
+}
+
+export interface DisplayResultEvent extends SkillEvent {
+  type: 'display_result';
+  data: DisplayResult;
+}
+
+export interface DiagnosticEvent extends SkillEvent {
+  type: 'diagnostic_found';
+  data: DiagnosticResult;
+}
+
+export interface AIThinkingEvent extends SkillEvent {
+  type: 'ai_thinking';
+  data: {
+    prompt: string;
+    context?: string;
+  };
+}
+
+export interface AIResponseEvent extends SkillEvent {
+  type: 'ai_response';
+  data: {
+    response: string;
+    tokens?: number;
+  };
+}
+
+// =============================================================================
+// Vendor Types
+// =============================================================================
+
+export type VendorType = 'oppo' | 'vivo' | 'xiaomi' | 'honor' | 'transsion' | 'mtk' | 'qualcomm' | 'samsung' | 'aosp' | 'unknown';
+
+export interface VendorDetectionResult {
+  vendor: VendorType;
+  confidence: ConfidenceLevel;
+  matchedPatterns?: string[];
+}
+
+// =============================================================================
+// Module Expert Types (Phase 1 - Cross-Domain Expert System)
+// =============================================================================
+
+/**
+ * Module layer in the Android architecture stack
+ */
+export type ModuleLayer = 'app' | 'framework' | 'kernel' | 'hardware';
+
+/**
+ * Module metadata - identifies which layer and component this skill belongs to
+ */
+export interface ModuleMetadata {
+  /** Architecture layer */
+  layer: ModuleLayer;
+  /** Component name (e.g., "AMS", "Scheduler", "CPU") */
+  component: string;
+  /** Sub-components this module covers */
+  subsystems?: string[];
+  /** Related modules that may be consulted */
+  relatedModules?: string[];
+}
+
+/**
+ * Dialogue capability - a question type this module can answer
+ */
+export interface DialogueCapability {
+  /** Unique capability ID */
+  id: string;
+  /** Question template with placeholders */
+  questionTemplate: string;
+  /** Required parameters for this question */
+  requiredParams: string[];
+  /** Optional parameters */
+  optionalParams?: string[];
+  /** Description of what this capability analyzes */
+  description?: string;
+}
+
+/**
+ * Finding schema - structured finding output format
+ */
+export interface FindingSchema {
+  /** Finding type ID */
+  id: string;
+  /** Severity level */
+  severity: 'info' | 'warning' | 'critical';
+  /** Title template with placeholders */
+  titleTemplate: string;
+  /** Description template */
+  descriptionTemplate?: string;
+  /** Fields to include as evidence */
+  evidenceFields?: string[];
+}
+
+/**
+ * Suggestion schema - suggests next analysis steps
+ */
+export interface SuggestionSchema {
+  /** Suggestion ID */
+  id: string;
+  /** Condition expression to trigger this suggestion */
+  condition: string;
+  /** Target module to consult */
+  targetModule: string;
+  /** Question template for the target module */
+  questionTemplate: string;
+  /** Parameter mapping from current results to target params */
+  paramsMapping?: Record<string, string>;
+  /** Priority (lower = higher priority) */
+  priority?: number;
+}
+
+/**
+ * Dialogue interface - how cross-domain experts interact with this module
+ */
+export interface DialogueInterface {
+  /** Questions this module can answer */
+  capabilities?: DialogueCapability[];
+  /** Structured findings this module produces */
+  findingsSchema?: FindingSchema[];
+  /** Suggestions for follow-up analysis */
+  suggestionsSchema?: SuggestionSchema[];
+}
+
+// =============================================================================
+// Loaded Skill
+// =============================================================================
+
+/**
+ * Loaded Skill - unified format for both atomic and composite skills
+ */
+export interface LoadedSkill {
+  id: string;
+  definition: SkillDefinition;
+  filePath: string;
+}
+
+/**
+ * Simplified Skill Result - for compatibility with adapters
+ */
+export interface SimplifiedSkillResult {
+  skillId: string;
+  skillName: string;
+  success: boolean;
+  sections: Record<string, any>;
+  diagnostics: DiagnosticResult[];
+  summary: string;
+  executionTimeMs: number;
+  displayResults?: DisplayResult[];
+  aiSummary?: string;
+}

@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# 触摸到显示延迟分析（原子 Skill）v2.0
+# =============================================================================
+# 使用 Perfetto stdlib android_input_events 表进行完整的 5 维延迟分解。
+# 基于 slice 解析（sendMessage/receiveMessage），兼容大多数 atrace 配置。
+#
+# v2.0 变更：
+# - 从 android_input_event_dispatch (proto) 迁移到 android_input_events (slice-based)
+# - 新增 5 维延迟分解：dispatch/handling/ack/total/end_to_end
+# - 新增 normalized_event_channel 窗口归一化
+# - 新增 is_speculative_frame 帧关联置信度标记
+#
+# 数据源依赖：trace 需包含 input atrace category（sendMessage/receiveMessage slices）
+
+name: touch_to_display_latency
+version: "2.0"
+type: atomic
+category: input_response
+tier: B
+
+meta:
+  display_name: "触摸到显示延迟 (区间)"
+  description: "基于 android_input_events 的 5 维延迟分解，测量每个输入事件的端到端延迟"
+  icon: "touch_app"
+  tags: [touch, latency, display, follow_finger, atomic]
+
+prerequisites:
+  modules:
+    - android.input
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "目标进程名（支持 GLOB）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+  - name: event_type
+    type: string
+    required: false
+    description: "输入事件类型过滤（如 MOTION/KEY）"
+
+display:
+  level: detail
+  layer: list
+  title: "触摸到显示延迟"
+  columns:
+    - name: input_ts
+      label: "输入时间"
+      type: timestamp
+      unit: ns
+      clickAction: navigate_timeline
+    - name: process_name
+      label: "进程"
+      type: string
+    - name: event_type
+      label: "事件类型"
+      type: string
+    - name: event_action
+      label: "事件动作"
+      type: string
+    - name: dispatch_latency_ms
+      label: "分发延迟"
+      type: duration
+      format: duration_ms
+    - name: handling_latency_ms
+      label: "处理延迟"
+      type: duration
+      format: duration_ms
+    - name: ack_latency_ms
+      label: "ACK 延迟"
+      type: duration
+      format: duration_ms
+    - name: total_latency_ms
+      label: "总延迟"
+      type: duration
+      format: duration_ms
+    - name: e2e_latency_ms
+      label: "端到端延迟"
+      type: duration
+      format: duration_ms
+    - name: normalized_channel
+      label: "窗口"
+      type: string
+    - name: is_speculative_frame
+      label: "推测帧"
+      type: boolean
+    - name: rating
+      label: "评级"
+      type: string
+
+sql: |
+  SELECT
+    printf('%d', dispatch_ts) as input_ts,
+    process_name,
+    event_type,
+    event_action,
+    ROUND(dispatch_latency_dur / 1e6, 2) as dispatch_latency_ms,
+    ROUND(handling_latency_dur / 1e6, 2) as handling_latency_ms,
+    ROUND(ack_latency_dur / 1e6, 2) as ack_latency_ms,
+    ROUND(total_latency_dur / 1e6, 2) as total_latency_ms,
+    ROUND(end_to_end_latency_dur / 1e6, 2) as e2e_latency_ms,
+    normalized_event_channel as normalized_channel,
+    is_speculative_frame,
+    CASE
+      WHEN total_latency_dur / 1e6 < 32 THEN '优秀'
+      WHEN total_latency_dur / 1e6 < 64 THEN '良好'
+      WHEN total_latency_dur / 1e6 < 100 THEN '可接受'
+      WHEN total_latency_dur / 1e6 < 150 THEN '需优化'
+      ELSE '严重'
+    END as rating
+  FROM android_input_events
+  WHERE (process_name GLOB '${package}*' OR '${package}' = '')
+    AND (${start_ts} IS NULL OR dispatch_ts >= ${start_ts})
+    AND (${end_ts} IS NULL OR dispatch_ts <= ${end_ts})
+    AND ('${event_type}' = '' OR event_type = '${event_type}')
+  ORDER BY total_latency_dur DESC
+
+output:
+  format: structured

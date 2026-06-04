@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# 输入事件列表（原子 Skill）v2.0
+# =============================================================================
+# 使用 Perfetto stdlib android_input_events 表提取完整 IPC 周期的输入事件。
+# 基于 slice 解析（sendMessage/receiveMessage），兼容大多数 atrace 配置。
+#
+# v2.0 变更：
+# - 从 android_input_event_dispatch (proto) 迁移到 android_input_events (slice-based)
+# - 新增 5 维延迟分解：dispatch/handling/ack/total/end_to_end
+# - 新增 normalized_event_channel 窗口归一化
+#
+# 注意：android_input_events 仅包含完整走完 dispatch→receive→finish→finish_ack
+# 四阶段的事件。total_latency_dur 是 dispatch-to-ACK，不是不完整事件
+# 或真实上屏延迟；不完整/部分分发的事件不会出现在结果中。
+
+name: input_events_in_range
+version: "2.0"
+type: atomic
+category: input_response
+tier: B
+
+meta:
+  display_name: "输入事件列表 (区间)"
+  description: "提取区间内已完成 ACK 的输入事件（触摸、按键），包含 dispatch/handling/ACK 和可用的 frame 关联延迟"
+  icon: "touch_app"
+  tags: [input, events, touch, key, atomic]
+
+prerequisites:
+  modules:
+    - android.input
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "目标进程名（支持 GLOB）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+  - name: event_type
+    type: string
+    required: false
+    description: "事件类型过滤（MOTION/KEY）"
+  - name: event_action
+    type: string
+    required: false
+    description: "事件动作过滤（DOWN/MOVE/UP）"
+
+display:
+  level: detail
+  layer: list
+  title: "输入事件列表"
+  columns:
+    - name: event_ts
+      label: "事件时间"
+      type: timestamp
+      unit: ns
+      clickAction: navigate_timeline
+    - name: event_type
+      label: "事件类型"
+      type: string
+    - name: event_action
+      label: "事件动作"
+      type: string
+    - name: dispatch_latency_ms
+      label: "分发延迟"
+      type: duration
+      format: duration_ms
+    - name: handling_latency_ms
+      label: "处理延迟"
+      type: duration
+      format: duration_ms
+    - name: ack_latency_ms
+      label: "ACK 延迟"
+      type: duration
+      format: duration_ms
+    - name: total_latency_ms
+      label: "总延迟(ACK)"
+      type: duration
+      format: duration_ms
+    - name: e2e_latency_ms
+      label: "Input→Frame 延迟"
+      type: duration
+      format: duration_ms
+    - name: process_name
+      label: "目标进程"
+      type: string
+    - name: normalized_channel
+      label: "窗口"
+      type: string
+    - name: dispatch_status
+      label: "状态"
+      type: string
+
+sql: |
+  SELECT
+    printf('%d', dispatch_ts) as event_ts,
+    event_type,
+    event_action,
+    ROUND(dispatch_latency_dur / 1e6, 2) as dispatch_latency_ms,
+    ROUND(handling_latency_dur / 1e6, 2) as handling_latency_ms,
+    ROUND(ack_latency_dur / 1e6, 2) as ack_latency_ms,
+    ROUND(total_latency_dur / 1e6, 2) as total_latency_ms,
+    ROUND(end_to_end_latency_dur / 1e6, 2) as e2e_latency_ms,
+    process_name,
+    normalized_event_channel as normalized_channel,
+    CASE
+      WHEN total_latency_dur / 1e6 > 200 THEN '严重延迟'
+      WHEN total_latency_dur / 1e6 > 100 THEN '延迟偏高'
+      WHEN total_latency_dur / 1e6 > 50 THEN '轻微延迟'
+      ELSE '正常'
+    END as dispatch_status
+  FROM android_input_events
+  WHERE (process_name GLOB '${package}*' OR '${package}' = '')
+    AND (${start_ts} IS NULL OR dispatch_ts >= ${start_ts})
+    AND (${end_ts} IS NULL OR dispatch_ts <= ${end_ts})
+    AND ('${event_type}' = '' OR event_type = '${event_type}')
+    AND ('${event_action}' = '' OR event_action = '${event_action}')
+  ORDER BY dispatch_ts ASC
+
+output:
+  format: structured

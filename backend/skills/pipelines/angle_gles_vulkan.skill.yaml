@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# ANGLE GLES over Vulkan Pipeline
+# =============================================================================
+# OpenGL ES translated to Vulkan via ANGLE.
+# Used when Vulkan backend provides better compatibility or performance.
+# =============================================================================
+
+name: pipeline_angle_gles_vulkan
+version: "1.0"
+type: pipeline_definition
+category: rendering
+
+meta:
+  pipeline_id: ANGLE_GLES_VULKAN
+  display_name: "ANGLE (GLES over Vulkan)"
+  description: "通过 ANGLE 将 OpenGL ES 翻译为 Vulkan"
+  icon: "translate"
+  family: graphics
+  doc_path: "rendering_pipelines/angle_gles_vulkan.md"
+  # ----- Article-grounded signature (S08) -----
+  s_article_ref: "S08"
+  four_features:
+    producer_threads: ["GLThread", "RenderThread", "any custom"]
+    expected_layer_count: 1
+    bufferqueue_path: "ANATIVEWINDOW_VULKAN_SWAPCHAIN_VIA_ANGLE"   # ANGLE 翻译 → Vulkan swapchain
+    extra_rhythm_sources: []
+  deviation_anchors: "translation_layer_anchor_4_5_6"
+  # 锚点偏离：应用看到的是 GLES API（glDraw* / eglSwapBuffers），底层实际通过 ANGLE 翻译为 Vulkan
+  # （vkCmdDraw* / vkQueuePresentKHR）。两组 slice 同时出现是该 pipeline 的标志。
+  non_primary_note: |
+    此 pipeline_id 已在代码 NON_PRIMARY_PIPELINE_IDS 中（renderingPipelineDetectionSkillGenerator.ts:23），
+    不会被选为 primary，只出现在 features list。它属于"实现细节/正交特征"，与 OPENGL_ES / VULKAN_NATIVE 的 primary 选择并不冲突。
+  ecosystem_note: |
+    Android 生态中 ANGLE 常由 Chromium / WebView / 自研内核启用；游戏引擎也可能直接集成。
+    Android 15+ 对 ANGLE 的支持提升，但是否默认启用仍依设备和 OEM 策略。
+
+detection:
+  required_signals:
+    # GLES-over-Vulkan 常见会看到 Vulkan present；若完全没有 Vulkan 侧痕迹，更可能是 GLES 原生或 ANGLE 的其他后端
+    - slice_pattern: "*vkQueuePresentKHR*"
+      min_count: 1
+
+  scoring_signals:
+    - signal: has_angle
+      slice_pattern: "*ANGLE*"
+      weight: 80
+
+teaching:
+  title: "ANGLE GLES over Vulkan 渲染管线"
+  summary: |
+    使用 ANGLE 库将 OpenGL ES 调用翻译为 Vulkan 命令。
+    这种模式提供了更好的驱动兼容性和可能的性能提升，
+    同时应用代码仍然使用熟悉的 OpenGL ES API。ANGLE 在 Android 15+
+    生态中的重要性提升，但是否默认启用仍依设备和 OEM 策略而异。
+
+    经验要点:
+    - Android 生态中 ANGLE 常由 Chromium/WebView/自研内核启用（也可能被游戏引擎/应用直接集成）
+    - 该 pipeline 关注“GLES → Vulkan”的翻译链路；若仅看到 eglSwapBuffers 而缺少 vkQueuePresentKHR，
+      更可能是 GLES 原生或 ANGLE 的 OpenGL 后端
+
+  mermaid: |
+    sequenceDiagram
+      participant App as App (GLES)
+      participant ANGLE as ANGLE Layer
+      participant VK as Vulkan Backend
+      participant BQ as BufferQueue
+      participant VS as VSync-sf
+      participant SF as SurfaceFlinger
+
+      Note over App,SF: 📍 ANGLE (GLES-over-Vulkan)
+      App->>ANGLE: glDraw* 调用
+      activate ANGLE
+      ANGLE->>VK: 转换为 Vulkan 命令
+      VK->>VK: vkQueueSubmit
+      ANGLE->>ANGLE: eglSwapBuffers
+      VK->>BQ: vkQueuePresentKHR
+      deactivate ANGLE
+
+      VS->>SF: 🔔 VSync-sf
+      activate SF
+      SF->>SF: latchBuffer
+      SF->>SF: HWC 合成
+      deactivate SF
+
+      Note over App,SF: 🔄 GLES 应用透明迁移到 Vulkan 后端
+  thread_roles:
+    - thread: main
+      role: "应用逻辑"
+      description: "发起 OpenGL ES 调用"
+    - thread: GLThread
+      role: "GLES/ANGLE 调用线程"
+      description: "持有 EGL context 的线程；GLES 调用经 ANGLE 翻译为 Vulkan（线程名可能为 GLThread/RenderThread/自定义）"
+
+  key_slices:
+    - name: "glDraw*"
+      thread: any
+      description: "应用侧 GLES 绘制调用（由 ANGLE 拦截并翻译）"
+    - name: "eglSwapBuffers"
+      thread: any
+      description: "交换 Buffer（最终触发 Present 路径）"
+    - name: "ANGLE"
+      thread: any
+      description: "ANGLE 翻译/状态管理（trace 名称通常包含 ANGLE）"
+    - name: "vkQueuePresentKHR"
+      thread: any
+      description: "Vulkan Present（ANGLE 后端常见）"
+
+auto_pin:
+  instructions:
+    # Time-ordered pinning (production -> transfer -> consume -> display)
+    - pattern: "^VSYNC-app$"
+      match_by: name
+      priority: 1
+      reason: "VSync (App 开始生产帧)"
+
+    - pattern: "^main(\\s+\\d+)?$"
+      match_by: name
+      priority: 2
+      reason: "应用逻辑 (生产)"
+      expand: true  # 展开显示 Running 状态和 callstack
+      smart_filter:
+        enabled: true
+        description: "仅 Pin 活跃渲染进程的主线程"
+
+    - pattern: "^RenderThread(\\s+\\d+)?$|GLThread|ANGLE|Vulkan|Vk"
+      match_by: name
+      priority: 3
+      reason: "ANGLE 翻译层 (传输)"
+      expand: true  # 展开显示 Running 状态和 callstack
+      smart_filter:
+        enabled: true
+        description: "仅 Pin 活跃渲染进程的渲染/翻译线程"
+
+    - pattern: "^VSYNC-sf$"
+      match_by: name
+      priority: 5.5
+      reason: "VSync (SurfaceFlinger 消费/合成)"
+
+    - pattern: "^BufferTX"
+      match_by: name
+      priority: 6
+      reason: "BufferTX (SurfaceFlinger 事务)"
+
+    - pattern: "^[sS]urface[fF]linger"
+      match_by: name
+      priority: 7
+      reason: "最终合成/显示"
+      main_thread_only: true
+
+analysis:
+  common_issues:
+    - id: angle_overhead
+      name: "ANGLE 翻译开销"
+      description: "API 翻译层的 CPU 开销"
+      detection_skill: cpu_analysis
+
+    # ----- Article-grounded issues (S08) -----
+    - id: angle_validation_overhead
+      name: "ANGLE GLES 状态验证开销"
+      description: |
+        ANGLE 需要把 GLES 状态机映射到 Vulkan 的显式状态对象（pipeline、descriptor set、render pass 等），
+        每次 GLES 调用都涉及状态验证。状态变化频繁的应用 CPU 开销显著。
+      detection_skill: cpu_analysis
+
+    - id: dual_layer_slices_visible
+      name: "trace 同时出现 GLES + Vulkan slice 是 ANGLE 标志"
+      description: |
+        在同一进程同时看到 glDraw* / eglSwapBuffers（应用层）和 vkCmdDraw* / vkQueuePresentKHR（ANGLE 后端）
+        是该 pipeline 的决定性信号。仅看到 GLES 而无 Vulkan 痕迹更可能是 GLES 原生或 ANGLE 的 OpenGL 后端。
+      detection_skill: gpu_analysis
+
+  recommended_skills:
+    - gpu_analysis
+    - cpu_analysis

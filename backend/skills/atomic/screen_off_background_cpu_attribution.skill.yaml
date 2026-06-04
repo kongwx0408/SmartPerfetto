@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# Screen-off Background CPU Attribution
+# =============================================================================
+# Uses android.screen_state plus raw sched overlap so the analysis remains
+# deterministic and does not call interval functions once per screen-off span.
+
+name: screen_off_background_cpu_attribution
+version: "1.0"
+type: atomic
+category: power
+tier: A
+
+meta:
+  display_name: "熄屏后台 CPU 归因"
+  description: "在 screen-off / doze 窗口内按进程/线程聚合 CPU runtime，定位后台偷跑"
+  icon: "screen_lock_portrait"
+  tags: [power, screen_off, background_cpu, sched, attribution, atomic]
+
+triggers:
+  keywords:
+    zh: [熄屏 CPU, 后台 CPU, screen-off CPU, 待机耗电, 偷跑]
+    en: [screen-off CPU, background CPU, standby drain, background drain]
+  patterns:
+    - ".*(熄屏|待机|screen-off).*(CPU|后台).*"
+    - ".*background.*CPU.*"
+
+prerequisites:
+  required_tables:
+    - sched
+    - thread
+    - process
+  modules:
+    - android.screen_state
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "目标包名或进程名前缀（可选）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+  - name: top_n
+    type: number
+    required: false
+    default: 30
+    description: "返回前 N 个后台 CPU 进程/线程"
+
+steps:
+  - id: screen_off_cpu
+    type: atomic
+    name: "熄屏后台 CPU"
+    display:
+      level: summary
+      layer: list
+      title: "熄屏/Doze 窗口后台 CPU"
+      columns:
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: thread_name
+          label: "线程"
+          type: string
+        - name: screen_off_time_sec
+          label: "熄屏窗口(秒)"
+          type: number
+          format: compact
+        - name: runtime_ms
+          label: "CPU runtime(ms)"
+          type: duration
+          format: duration_ms
+        - name: cpu_util_pct
+          label: "CPU 占用(%)"
+          type: percentage
+        - name: evidence_status
+          label: "证据状态"
+          type: string
+    sql: |
+      WITH bounds AS (
+        SELECT
+          COALESCE(${start_ts}, trace_start()) AS start_ts,
+          COALESCE(${end_ts}, trace_end()) AS end_ts
+      ),
+      screen_off AS (
+        SELECT
+          MAX(s.ts, b.start_ts) AS ts,
+          MIN(s.ts + s.dur, b.end_ts) AS ts_end,
+          MIN(s.ts + s.dur, b.end_ts) - MAX(s.ts, b.start_ts) AS dur
+        FROM android_screen_state s
+        CROSS JOIN bounds b
+        WHERE s.simple_screen_state IN ('off', 'doze')
+          AND s.ts < b.end_ts
+          AND s.ts + s.dur > b.start_ts
+      ),
+      totals AS (
+        SELECT SUM(dur) AS total_screen_off_dur
+        FROM screen_off
+        WHERE dur > 0
+      ),
+      runtime AS (
+        SELECT
+          COALESCE(p.name, '') AS process_name,
+          COALESCE(th.name, '') AS thread_name,
+          SUM(MIN(s.ts + s.dur, o.ts_end) - MAX(s.ts, o.ts)) AS runtime_ns
+        FROM screen_off o
+        JOIN sched s
+          ON s.ts < o.ts_end
+          AND s.ts + s.dur > o.ts
+        JOIN thread th USING (utid)
+        LEFT JOIN process p USING (upid)
+        WHERE o.dur > 0
+          AND NOT th.is_idle
+          AND (COALESCE(p.name, '') GLOB '${package}*' OR '${package}' = '')
+        GROUP BY process_name, thread_name
+      ),
+      cpu_count AS (
+        SELECT COALESCE(MAX(cpu) + 1, 1) AS cpus
+        FROM cpu
+      ),
+      ranked AS (
+        SELECT
+          process_name,
+          thread_name,
+          ROUND((SELECT total_screen_off_dur FROM totals) / 1e9, 2) AS screen_off_time_sec,
+          ROUND(runtime_ns / 1e6, 2) AS runtime_ms,
+          ROUND(runtime_ns * 100.0 / NULLIF((SELECT total_screen_off_dur FROM totals) * (SELECT cpus FROM cpu_count), 0), 4) AS cpu_util_pct,
+          'screen_state_sched_overlap' AS evidence_status
+        FROM runtime
+        WHERE runtime_ns > 0
+        ORDER BY runtime_ns DESC
+        LIMIT ${top_n|30}
+      )
+      SELECT * FROM ranked
+      UNION ALL
+      SELECT
+        '' AS process_name,
+        '' AS thread_name,
+        ROUND(COALESCE((SELECT total_screen_off_dur FROM totals), 0) / 1e9, 2) AS screen_off_time_sec,
+        0 AS runtime_ms,
+        0 AS cpu_util_pct,
+        CASE
+          WHEN COALESCE((SELECT total_screen_off_dur FROM totals), 0) = 0 THEN 'no_screen_off_or_doze_window'
+          ELSE 'no_background_cpu_runtime'
+        END AS evidence_status
+      WHERE NOT EXISTS (SELECT 1 FROM ranked)
+
+output:
+  format: structured

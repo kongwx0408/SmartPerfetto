@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# DVFS 频率残留统计（B 级 atomic）
+# =============================================================================
+# 使用 android.dvfs 模块的 android_dvfs_counter_stats 视图，统计每个 DVFS
+# counter（cpu_freq、gpu_freq、ddr_freq 等）的最小/最大/平均值。
+
+name: android_dvfs_counter_stats
+version: "1.0"
+type: atomic
+category: power
+tier: B
+
+meta:
+  display_name: "DVFS Counter 统计"
+  description: "CPU/GPU/DDR 频率统计（min/max/avg）"
+  icon: "tune"
+  tags: [dvfs, freq, cpu, gpu, atomic]
+
+prerequisites:
+  modules:
+    - android.dvfs
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+steps:
+  - id: dvfs_stats
+    type: atomic
+    name: "DVFS 频率统计"
+    display:
+      level: detail
+      layer: list
+      title: "DVFS Counter 统计"
+      columns:
+        - name: name
+          label: "Counter"
+          type: string
+        - name: min
+          label: "最小"
+          type: number
+          format: compact
+        - name: max
+          label: "最大"
+          type: number
+          format: compact
+        - name: wgt_avg
+          label: "加权平均"
+          type: number
+          format: compact
+        - name: observed_sec
+          label: "观测时长(秒)"
+          type: number
+          format: compact
+    sql: |
+      WITH clipped AS (
+        SELECT
+          name,
+          value,
+          MIN(ts + dur, COALESCE(${end_ts}, trace_end())) -
+            MAX(ts, COALESCE(${start_ts}, trace_start())) AS clipped_dur
+        FROM android_dvfs_counters
+        WHERE ts < COALESCE(${end_ts}, trace_end())
+          AND ts + dur > COALESCE(${start_ts}, trace_start())
+      )
+      SELECT
+        name,
+        MIN(value) AS min,
+        MAX(value) AS max,
+        ROUND(SUM(value * clipped_dur) / NULLIF(SUM(clipped_dur), 0), 1) AS wgt_avg,
+        ROUND(SUM(clipped_dur) / 1e9, 2) AS observed_sec
+      FROM clipped
+      WHERE clipped_dur > 0
+      GROUP BY name
+      ORDER BY name

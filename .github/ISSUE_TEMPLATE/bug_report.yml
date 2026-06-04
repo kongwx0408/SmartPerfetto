@@ -1,0 +1,151 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this bug.
+
+        If you are using an AI assistant to prepare this report, ask it to read
+        `AGENTS.md` and the relevant `.claude/rules/*` files first. This helps
+        us get the right product surface, runtime/provider, logs, and verification context.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug
+      placeholder: What happened? What did you expect?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of SmartPerfetto is affected?
+      options:
+        - AI Analysis (Agent)
+        - Skills (YAML)
+        - Strategies / Prompts
+        - Frontend (UI Panel)
+        - CLI (smp)
+        - Docker / Portable Package
+        - Provider Manager / Runtime Selection
+        - Reports / Snapshots / Export
+        - Code-Aware Analysis
+        - Trace Processor
+        - Backend (API/Server)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: entrypoint
+    attributes:
+      label: Entry Point
+      description: How did you run SmartPerfetto?
+      options:
+        - Web UI from source (`./start.sh`)
+        - Web UI dev mode (`./scripts/start-dev.sh`)
+        - Docker
+        - Portable app
+        - npm CLI (`smp` / `smartperfetto`)
+        - HTTP/SSE API
+        - Other / unsure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: AI Runtime / Provider
+      description: If this affects AI analysis, which runtime/provider was active?
+      options:
+        - Claude Agent SDK / Anthropic-compatible
+        - OpenAI Agents SDK / OpenAI
+        - OpenAI-compatible / Ollama
+        - Provider Manager active profile
+        - Not related to AI runtime
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce the issue?
+      placeholder: |
+        1. Load trace file '...'
+        2. Click '...'
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands / Query Used
+      description: Paste the command, user query, API request, or key UI action that triggered the bug.
+      placeholder: |
+        ./start.sh
+        smp run --trace ./trace.perfetto-trace --query "分析滑动性能"
+        POST /api/agent/v1/analyze ...
+        User query: ...
+
+  - type: textarea
+    id: trace-info
+    attributes:
+      label: Trace Information
+      description: If applicable, describe the trace. Do not attach private traces unless you intend to share them.
+      placeholder: |
+        Device: Pixel 8 Pro
+        Android: 15
+        Scene: Scrolling / Startup / ANR
+        Trace size:
+        Is the trace shareable? yes/no
+
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected vs Actual Behavior
+      description: What did you expect, and what happened instead?
+      placeholder: |
+        Expected:
+        Actual:
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Screenshots
+      description: Paste relevant logs from `backend/logs/sessions/`, browser console, CLI output, or attach screenshots. Redact secrets and private source paths if needed.
+      render: shell
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Your setup details
+      placeholder: |
+        OS: macOS 15.x / Ubuntu 24.04
+        Node.js: 24.x
+        Browser: Chrome 130
+        SmartPerfetto version / commit:
+        Install method:
+    validations:
+      required: true
+
+  - type: textarea
+    id: regression
+    attributes:
+      label: Regression / Verification Context
+      description: If known, tell us whether this worked before and any checks you ran.
+      placeholder: |
+        Last known good version/commit:
+        Checks run:
+        Relevant test or trace regression:

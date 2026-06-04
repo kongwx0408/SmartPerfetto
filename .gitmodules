@@ -1,0 +1,4 @@
+[submodule "perfetto"]
+	path = perfetto
+	url = https://github.com/Gracker/perfetto.git
+	branch = main

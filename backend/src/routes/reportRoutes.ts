@@ -1,0 +1,681 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Gracker (Chris)
+// This file is part of SmartPerfetto. See LICENSE for details.
+
+/**
+ * Report Routes
+ *
+ * API endpoints for generating and serving HTML analysis reports.
+ * Reports are persisted to disk (`logs/reports/`) and cached in memory.
+ */
+
+import express from 'express';
+import crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import type Database from 'better-sqlite3';
+import { attachRequestContext, requireRequestContext, type RequestContext } from '../middleware/auth';
+import { openEnterpriseDb } from '../services/enterpriseDb';
+import { recordEnterpriseAuditEventForContext } from '../services/enterpriseAuditService';
+import {
+  enterpriseDbReadAuthorityEnabled,
+  enterpriseDbWritesEnabled,
+  legacyFilesystemWritesEnabled,
+} from '../services/enterpriseMigration';
+import { REPORT_CAUSAL_MAP_CSS, REPORT_CAUSAL_MAP_SCRIPT } from '../services/reportCausalMapAssets';
+import { localize, parseOutputLanguage } from '../agentv3/outputLanguage';
+import { backendLogPath } from '../runtimePaths';
+import { resolveEnterpriseDataRoot } from '../services/traceMetadataStore';
+import { resolveEnterpriseRetentionExpiresAt } from '../services/enterpriseQuotaPolicyService';
+import {
+  sendResourceNotFound,
+  type ResourceOwnerFields,
+} from '../services/resourceOwnership';
+import {
+  canDeleteReportResource,
+  canReadReportResource,
+  sendForbidden,
+  sharesWorkspaceWithContext,
+} from '../services/rbac';
+
+const router = express.Router();
+
+const REPORTS_DIR = backendLogPath('reports');
+
+// Ensure reports directory exists
+if (!fs.existsSync(REPORTS_DIR)) {
+  fs.mkdirSync(REPORTS_DIR, { recursive: true });
+}
+
+router.use(attachRequestContext);
+
+// In-memory cache backed by disk persistence
+type PersistedReport = ResourceOwnerFields & {
+  html: string;
+  generatedAt: number;
+  sessionId: string;
+  runId?: string;
+  traceId?: string;
+  visibility?: string;
+  expiresAt?: number | null;
+};
+
+export const reportStore = new Map<string, PersistedReport>();
+
+interface ReportArtifactRow {
+  id: string;
+  tenant_id: string;
+  workspace_id: string;
+  session_id: string;
+  run_id: string;
+  local_path: string;
+  content_hash: string | null;
+  visibility: string;
+  created_by: string | null;
+  created_at: number;
+  expires_at: number | null;
+}
+
+function recordReportAudit(
+  context: RequestContext,
+  action: 'report.read' | 'report.exported' | 'report.deleted',
+  reportId: string,
+  report: PersistedReport,
+): void {
+  recordEnterpriseAuditEventForContext(context, {
+    action,
+    resourceType: 'report',
+    resourceId: reportId,
+    metadata: {
+      sessionId: report.sessionId,
+      runId: report.runId,
+      traceId: report.traceId,
+      visibility: report.visibility,
+    },
+  });
+}
+
+const SAFE_REPORT_ID_RE = /^[a-zA-Z0-9._:-]+$/;
+
+function enterpriseReportStoreEnabled(): boolean {
+  return enterpriseDbReadAuthorityEnabled();
+}
+
+function enterpriseReportDbWritesEnabled(): boolean {
+  return enterpriseDbWritesEnabled();
+}
+
+function legacyReportWritesEnabled(): boolean {
+  return legacyFilesystemWritesEnabled();
+}
+
+function assertSafeReportSegment(value: string, label: string): string {
+  if (!SAFE_REPORT_ID_RE.test(value) || value === '.' || value === '..') {
+    throw new Error(`Unsafe ${label}: ${value}`);
+  }
+  return value;
+}
+
+function reportContentHash(html: string): string {
+  return crypto.createHash('sha256').update(html).digest('hex');
+}
+
+function withEnterpriseReportDb<T>(fn: (db: Database.Database) => T): T {
+  const db = openEnterpriseDb();
+  try {
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
+
+function enterpriseReportDir(reportId: string, entry: PersistedReport): string {
+  if (!entry.tenantId || !entry.workspaceId) {
+    throw new Error('Enterprise report persistence requires tenantId and workspaceId');
+  }
+  return path.join(
+    resolveEnterpriseDataRoot(),
+    assertSafeReportSegment(entry.tenantId, 'tenant id'),
+    assertSafeReportSegment(entry.workspaceId, 'workspace id'),
+    'reports',
+    assertSafeReportSegment(reportId, 'report id'),
+  );
+}
+
+function fallbackTraceId(entry: PersistedReport): string {
+  return entry.traceId || `trace-${entry.sessionId}-report`;
+}
+
+function fallbackRunId(entry: PersistedReport): string {
+  return entry.runId || `run-${entry.sessionId}-report`;
+}
+
+function isReportExpired(entry: PersistedReport, now = Date.now()): boolean {
+  return typeof entry.expiresAt === 'number' && entry.expiresAt <= now;
+}
+
+function ensureEnterpriseReportGraph(
+  db: Database.Database,
+  reportId: string,
+  entry: PersistedReport,
+): { traceId: string; runId: string } {
+  if (!entry.tenantId || !entry.workspaceId) {
+    throw new Error('Enterprise report persistence requires tenantId and workspaceId');
+  }
+  const tenantId = assertSafeReportSegment(entry.tenantId, 'tenant id');
+  const workspaceId = assertSafeReportSegment(entry.workspaceId, 'workspace id');
+  const userId = entry.userId ? assertSafeReportSegment(entry.userId, 'user id') : null;
+  const traceId = fallbackTraceId(entry);
+  const runId = fallbackRunId(entry);
+  const now = Date.now();
+
+  db.prepare(`
+    INSERT OR IGNORE INTO organizations (id, name, status, plan, created_at, updated_at)
+    VALUES (?, ?, 'active', 'enterprise', ?, ?)
+  `).run(tenantId, tenantId, now, now);
+  db.prepare(`
+    INSERT OR IGNORE INTO workspaces (id, tenant_id, name, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(workspaceId, tenantId, workspaceId, now, now);
+  if (userId) {
+    db.prepare(`
+      INSERT INTO users (id, tenant_id, email, display_name, idp_subject, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        email = excluded.email,
+        display_name = excluded.display_name,
+        updated_at = excluded.updated_at
+    `).run(
+      userId,
+      tenantId,
+      `${userId}@report.local`,
+      userId,
+      `report:${userId}`,
+      now,
+      now,
+    );
+  }
+  db.prepare(`
+    INSERT OR IGNORE INTO trace_assets
+      (id, tenant_id, workspace_id, owner_user_id, local_path, size_bytes, status, metadata_json, created_at)
+    VALUES
+      (?, ?, ?, ?, ?, 0, 'metadata_only', ?, ?)
+  `).run(
+    traceId,
+    tenantId,
+    workspaceId,
+    userId,
+    `metadata-only:${traceId}`,
+    JSON.stringify({ source: 'report_artifact', reportId }),
+    entry.generatedAt || now,
+  );
+  db.prepare(`
+    INSERT OR IGNORE INTO analysis_sessions
+      (id, tenant_id, workspace_id, trace_id, created_by, title, visibility, status, created_at, updated_at)
+    VALUES
+      (?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
+  `).run(
+    entry.sessionId,
+    tenantId,
+    workspaceId,
+    traceId,
+    userId,
+    `Report ${reportId}`,
+    entry.visibility || 'private',
+    entry.generatedAt || now,
+    now,
+  );
+  db.prepare(`
+    INSERT OR IGNORE INTO analysis_runs
+      (id, tenant_id, workspace_id, session_id, mode, status, question, started_at, completed_at)
+    VALUES
+      (?, ?, ?, ?, 'report', 'completed', '', ?, ?)
+  `).run(
+    runId,
+    tenantId,
+    workspaceId,
+    entry.sessionId,
+    entry.generatedAt || now,
+    entry.generatedAt || now,
+  );
+
+  return { traceId, runId };
+}
+
+function persistEnterpriseReport(reportId: string, entry: PersistedReport): void {
+  const reportDir = enterpriseReportDir(reportId, entry);
+  const htmlPath = path.join(reportDir, 'report.html');
+  const metadataPath = path.join(reportDir, 'report.json');
+  fs.mkdirSync(reportDir, { recursive: true });
+  fs.writeFileSync(htmlPath, entry.html, 'utf-8');
+
+  withEnterpriseReportDb((db) => {
+    const { runId } = ensureEnterpriseReportGraph(db, reportId, entry);
+    const createdAt = entry.generatedAt || Date.now();
+    const visibility = entry.visibility || 'private';
+    const contentHash = reportContentHash(entry.html);
+    const expiresAt = resolveEnterpriseRetentionExpiresAt(
+      db,
+      {
+        tenantId: entry.tenantId!,
+        workspaceId: entry.workspaceId!,
+        ...(entry.userId ? { userId: entry.userId } : {}),
+      },
+      'report',
+      createdAt,
+    );
+    entry.expiresAt = expiresAt;
+    db.prepare(`
+      INSERT INTO report_artifacts
+        (id, tenant_id, workspace_id, session_id, run_id, local_path, content_hash, visibility, created_by, created_at, expires_at)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        tenant_id = excluded.tenant_id,
+        workspace_id = excluded.workspace_id,
+        session_id = excluded.session_id,
+        run_id = excluded.run_id,
+        local_path = excluded.local_path,
+        content_hash = excluded.content_hash,
+        visibility = excluded.visibility,
+        created_by = excluded.created_by,
+        expires_at = excluded.expires_at
+    `).run(
+      reportId,
+      entry.tenantId,
+      entry.workspaceId,
+      entry.sessionId,
+      runId,
+      htmlPath,
+      contentHash,
+      visibility,
+      entry.userId ?? null,
+      createdAt,
+      expiresAt,
+    );
+
+    fs.writeFileSync(metadataPath, JSON.stringify({
+      reportId,
+      generatedAt: createdAt,
+      sessionId: entry.sessionId,
+      runId,
+      traceId: fallbackTraceId(entry),
+      tenantId: entry.tenantId,
+      workspaceId: entry.workspaceId,
+      userId: entry.userId,
+      visibility,
+      contentHash,
+      expiresAt,
+    }, null, 2));
+  });
+}
+
+function persistLegacyReport(reportId: string, entry: PersistedReport): void {
+  const filePath = path.join(REPORTS_DIR, `${reportId}.html`);
+  fs.writeFileSync(filePath, entry.html, 'utf-8');
+  const metaPath = path.join(REPORTS_DIR, `${reportId}.meta.json`);
+  fs.writeFileSync(metaPath, JSON.stringify({
+    generatedAt: entry.generatedAt,
+    sessionId: entry.sessionId,
+    runId: entry.runId,
+    traceId: entry.traceId,
+    tenantId: entry.tenantId,
+    workspaceId: entry.workspaceId,
+    userId: entry.userId,
+    visibility: entry.visibility,
+    expiresAt: entry.expiresAt,
+  }));
+}
+
+function loadEnterpriseReport(reportId: string): PersistedReport | null {
+  if (!SAFE_REPORT_ID_RE.test(reportId)) return null;
+  try {
+    return withEnterpriseReportDb((db) => {
+      const row = db.prepare<unknown[], ReportArtifactRow>(`
+        SELECT *
+        FROM report_artifacts
+        WHERE id = ?
+          AND (expires_at IS NULL OR expires_at > ?)
+      `).get(reportId, Date.now());
+      if (!row || !fs.existsSync(row.local_path)) return null;
+      const html = fs.readFileSync(row.local_path, 'utf-8');
+      const entry: PersistedReport = {
+        html: upgradeLegacyReportHtml(html),
+        generatedAt: row.created_at,
+        sessionId: row.session_id,
+        runId: row.run_id,
+        tenantId: row.tenant_id,
+        workspaceId: row.workspace_id,
+        ...(row.created_by ? { userId: row.created_by } : {}),
+        visibility: row.visibility,
+        expiresAt: row.expires_at,
+      };
+      reportStore.set(reportId, entry);
+      return entry;
+    });
+  } catch {
+    return null;
+  }
+}
+
+const LEGACY_MERMAID_UPGRADE_CSS = REPORT_CAUSAL_MAP_CSS;
+
+const LEGACY_MERMAID_UPGRADE_SCRIPT = REPORT_CAUSAL_MAP_SCRIPT;
+
+export function upgradeLegacyReportHtml(html: string): string {
+  if (!html || !html.includes('<pre class="mermaid">')) return html;
+  if (html.includes('parseMermaidFlowSource(') || html.includes('class="causal-map"')) return html;
+
+  let upgraded = html;
+  upgraded = upgraded.replace(
+    '</style>',
+    `${LEGACY_MERMAID_UPGRADE_CSS}\n</style>`,
+  );
+  upgraded = upgraded.replace(
+    /<pre class="mermaid">([\s\S]*?)<\/pre>/g,
+    '<div class="mermaid-wrapper"><pre class="mermaid">$1</pre></div>',
+  );
+  upgraded = upgraded.replace(
+    /if \(typeof mermaid !== 'undefined'\) \{[\s\S]*?mermaid\.run\(\{ querySelector: 'pre\.mermaid' \}\);\s*\}/,
+    LEGACY_MERMAID_UPGRADE_SCRIPT.trim(),
+  );
+  return upgraded;
+}
+
+/** Save a report to disk. Called externally when reports are generated. */
+export function persistReport(reportId: string, entry: PersistedReport): void {
+  reportStore.set(reportId, entry);
+  try {
+    if (legacyReportWritesEnabled()) {
+      persistLegacyReport(reportId, entry);
+    }
+    if (enterpriseReportDbWritesEnabled()) {
+      persistEnterpriseReport(reportId, entry);
+    }
+  } catch (err) {
+    console.warn('[ReportRoutes] Failed to persist report to disk:', (err as Error).message);
+  }
+}
+
+/** Load a report from disk if not in memory cache. */
+function loadReportFromDisk(reportId: string): PersistedReport | null {
+  if (enterpriseReportStoreEnabled()) {
+    return loadEnterpriseReport(reportId);
+  }
+  return loadLegacyReportFromDisk(reportId);
+}
+
+function loadLegacyReportFromDisk(reportId: string): PersistedReport | null {
+  try {
+    const filePath = path.join(REPORTS_DIR, `${reportId}.html`);
+    if (!fs.existsSync(filePath)) return null;
+
+    const html = fs.readFileSync(filePath, 'utf-8');
+    const metaPath = path.join(REPORTS_DIR, `${reportId}.meta.json`);
+    let generatedAt = Date.now();
+    let sessionId = '';
+    let runId: string | undefined;
+    let traceId: string | undefined;
+    let visibility: string | undefined;
+    let expiresAt: number | undefined;
+    let owner: ResourceOwnerFields = {};
+    if (fs.existsSync(metaPath)) {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      generatedAt = meta.generatedAt || generatedAt;
+      sessionId = meta.sessionId || '';
+      runId = meta.runId;
+      traceId = meta.traceId;
+      visibility = meta.visibility;
+      expiresAt = typeof meta.expiresAt === 'number' ? meta.expiresAt : undefined;
+      owner = {
+        tenantId: meta.tenantId,
+        workspaceId: meta.workspaceId,
+        userId: meta.userId,
+        ownerUserId: meta.ownerUserId,
+      };
+      if (typeof expiresAt === 'number' && expiresAt <= Date.now()) {
+        return null;
+      }
+    }
+
+    const entry = {
+      html: upgradeLegacyReportHtml(html),
+      generatedAt,
+      sessionId,
+      ...(runId ? { runId } : {}),
+      ...(traceId ? { traceId } : {}),
+      ...(visibility ? { visibility } : {}),
+      ...(typeof expiresAt === 'number' ? { expiresAt } : {}),
+      ...owner,
+    };
+    // Cache in memory for subsequent access
+    reportStore.set(reportId, entry);
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+function deleteLegacyReport(reportId: string): boolean {
+  try {
+    const htmlPath = path.join(REPORTS_DIR, `${reportId}.html`);
+    const metaPath = path.join(REPORTS_DIR, `${reportId}.meta.json`);
+    const existed = fs.existsSync(htmlPath) || fs.existsSync(metaPath);
+    if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath);
+    if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+    return existed;
+  } catch {
+    return false;
+  }
+}
+
+function deleteEnterpriseReport(reportId: string): boolean {
+  if (!SAFE_REPORT_ID_RE.test(reportId)) return false;
+  try {
+    return withEnterpriseReportDb((db) => {
+      const row = db.prepare<unknown[], ReportArtifactRow>(
+        'SELECT * FROM report_artifacts WHERE id = ?',
+      ).get(reportId);
+      if (!row) return false;
+      db.prepare('DELETE FROM report_artifacts WHERE id = ?').run(reportId);
+      try {
+        const reportDir = path.dirname(row.local_path);
+        const metadataPath = path.join(reportDir, 'report.json');
+        if (fs.existsSync(row.local_path)) fs.unlinkSync(row.local_path);
+        if (fs.existsSync(metadataPath)) fs.unlinkSync(metadataPath);
+        fs.rmSync(reportDir, { recursive: true, force: true });
+      } catch { /* non-fatal */ }
+      return true;
+    });
+  } catch {
+    return false;
+  }
+}
+
+function deletePersistedReport(reportId: string): boolean {
+  let deleted = false;
+  if (enterpriseReportDbWritesEnabled()) {
+    deleted = deleteEnterpriseReport(reportId) || deleted;
+  }
+  if (legacyReportWritesEnabled()) {
+    deleted = deleteLegacyReport(reportId) || deleted;
+  }
+  return deleted;
+}
+
+function getReportForContext(reportId: string, req: express.Request): PersistedReport | null {
+  const context = requireRequestContext(req);
+  const report = reportStore.get(reportId) || loadReportFromDisk(reportId);
+  if (report && isReportExpired(report)) {
+    reportStore.delete(reportId);
+    return null;
+  }
+  if (!report || !canReadReportResource(report, context)) {
+    return null;
+  }
+  return report;
+}
+
+// Clean up old reports every 30 minutes (both memory and disk)
+const reportCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+
+  // Clean memory cache
+  for (const [reportId, report] of reportStore.entries()) {
+    if (now - report.generatedAt > maxAge) {
+      reportStore.delete(reportId);
+    }
+  }
+
+  if (legacyReportWritesEnabled()) {
+    try {
+      const files = fs.readdirSync(REPORTS_DIR);
+      for (const file of files) {
+        if (!file.endsWith('.meta.json')) continue;
+        const metaPath = path.join(REPORTS_DIR, file);
+        try {
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+          if (meta.generatedAt && now - meta.generatedAt > maxAge) {
+            const reportId = file.replace('.meta.json', '');
+            fs.unlinkSync(metaPath);
+            const htmlPath = path.join(REPORTS_DIR, `${reportId}.html`);
+            if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath);
+          }
+        } catch { /* skip individual file errors */ }
+      }
+    } catch { /* non-fatal */ }
+  }
+}, 30 * 60 * 1000);
+reportCleanupInterval.unref?.();
+
+/**
+ * GET /api/reports/:reportId/export
+ *
+ * Download the persisted HTML report artifact. The frontend/report page uses this
+ * endpoint together with the File System Access API so the user can choose the
+ * local destination and filename.
+ */
+router.get('/:reportId/export', (req, res) => {
+  try {
+    const { reportId } = req.params;
+    const context = requireRequestContext(req);
+
+    const report = getReportForContext(reportId, req);
+    if (!report) {
+      return res.status(404).json({
+        success: false,
+        error: 'Report not found',
+      });
+    }
+
+    const filename = `smartperfetto-${reportId}.html`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    recordReportAudit(context, 'report.exported', reportId, report);
+    res.send(upgradeLegacyReportHtml(report.html));
+  } catch (error: any) {
+    console.error('[ReportRoutes] Export report error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to export report',
+    });
+  }
+});
+
+/**
+ * GET /api/reports/:reportId
+ *
+ * Get HTML report by ID (memory cache → disk fallback)
+ */
+router.get('/:reportId', (req, res) => {
+  try {
+    const { reportId } = req.params;
+    const context = requireRequestContext(req);
+
+    // Try memory cache first, then disk
+    let report = getReportForContext(reportId, req);
+    if (!report) {
+      const outputLanguage = parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
+      return res.status(404).send(`
+        <!DOCTYPE html>
+        <html lang="${outputLanguage === 'en' ? 'en' : 'zh-CN'}">
+        <head>
+          <meta charset="UTF-8">
+          <title>${localize(outputLanguage, '报告未找到', 'Report Not Found')}</title>
+          <style>
+            body { font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f5f7fa; }
+            .error { text-align: center; padding: 40px; background: white; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.1); }
+            h1 { color: #ef4444; margin-bottom: 10px; }
+            p { color: #666; }
+          </style>
+        </head>
+        <body>
+          <div class="error">
+            <h1>${localize(outputLanguage, '报告未找到', 'Report Not Found')}</h1>
+            <p>${localize(outputLanguage, '该报告可能已过期或不存在。请重新生成分析报告。', 'This report may have expired or may not exist. Generate the analysis report again.')}</p>
+          </div>
+        </body>
+        </html>
+      `);
+    }
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    recordReportAudit(context, 'report.read', reportId, report);
+    res.send(upgradeLegacyReportHtml(report.html));
+  } catch (error: any) {
+    console.error('[ReportRoutes] Get report error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to get report',
+    });
+  }
+});
+
+// Note: Report generation is handled by agent-driven analysis routes.
+
+/**
+ * DELETE /api/reports/:reportId
+ *
+ * Delete a report from memory and disk
+ */
+router.delete('/:reportId', (req, res) => {
+  try {
+    const { reportId } = req.params;
+
+    const context = requireRequestContext(req);
+    const report = reportStore.get(reportId) || loadReportFromDisk(reportId);
+    if (!report || !sharesWorkspaceWithContext(report, context)) {
+      return sendResourceNotFound(res, 'Report not found');
+    }
+    if (!canDeleteReportResource(report, context)) {
+      return sendForbidden(res, 'Deleting this report requires report delete permission');
+    }
+
+    const deletedFromCache = reportStore.delete(reportId);
+    const deletedFromPersistence = deletePersistedReport(reportId);
+    const deleted = deletedFromCache || deletedFromPersistence;
+    if (deleted) {
+      recordReportAudit(context, 'report.deleted', reportId, report);
+    }
+
+    res.json({
+      success: deleted,
+      error: deleted ? undefined : 'Report not found',
+    });
+  } catch (error: any) {
+    console.error('[ReportRoutes] Delete report error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to delete report',
+    });
+  }
+});
+
+export default router;

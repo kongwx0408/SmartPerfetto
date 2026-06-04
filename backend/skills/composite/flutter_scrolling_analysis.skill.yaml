@@ -1,0 +1,443 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# Flutter Scrolling Analysis v1.0
+# =============================================================================
+# Flutter-specific frame analysis using Perfetto's actual_frame_timeline_slice
+# and Flutter thread model (1.ui / 1.raster / 1.io).
+#
+# This skill handles Flutter apps where standard Android frame detection
+# (Choreographer#doFrame, DrawFrame) is not applicable. It uses:
+#   - actual_frame_timeline_slice for universal frame timing
+#   - 1.ui thread for Dart/framework execution analysis
+#   - 1.raster thread for Impeller/Skia rendering analysis
+# =============================================================================
+
+name: flutter_scrolling_analysis
+version: "1.0"
+type: composite
+category: interaction
+tier: S
+
+meta:
+  display_name: "Flutter 滑动分析"
+  description: "Flutter 应用帧渲染分析：UI 线程 + Raster 线程 + 帧时序"
+  icon: "flutter"
+  tags: [flutter, scrolling, jank, fps, frames]
+
+prerequisites:
+  required_tables:
+    - actual_frame_timeline_slice
+  modules:
+    - android.frames.timeline
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "Flutter 应用包名"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳（纳秒）"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳（纳秒）"
+  - name: vsync_period_ns
+    type: number
+    required: false
+    description: "VSync 周期（纳秒），默认 16666667 (60Hz)"
+
+context:
+  - package
+  - vsync_period_ns
+  - refresh_rate_hz
+
+steps:
+  # ========== Step 1: Flutter 帧概览 ==========
+  - id: flutter_frame_overview
+    type: atomic
+    name: "Flutter 帧概览"
+    display:
+      level: summary
+      layer: overview
+      title: "Flutter 帧渲染概览"
+      format: table
+    sql: |
+      WITH flutter_frames AS (
+        SELECT
+          a.ts,
+          a.dur,
+          a.dur / 1e6 AS dur_ms,
+          a.jank_type,
+          a.jank_tag,
+          a.on_time_finish
+        FROM actual_frame_timeline_slice a
+        LEFT JOIN process p ON a.upid = p.upid
+        WHERE (
+          '${package}' = '' OR p.name LIKE '%${package}%'
+        )
+        AND (${start_ts} IS NULL OR a.ts >= ${start_ts})
+        AND (${end_ts} IS NULL OR a.ts <= ${end_ts})
+      )
+      SELECT
+        COUNT(*) AS total_frames,
+        ROUND(AVG(dur_ms), 2) AS avg_frame_ms,
+        ROUND(MAX(dur_ms), 2) AS max_frame_ms,
+        ROUND(MIN(dur_ms), 2) AS min_frame_ms,
+        SUM(CASE WHEN dur > ${vsync_period_ns|16666667} * 1.5 THEN 1 ELSE 0 END) AS jank_frames,
+        SUM(CASE WHEN jank_type != 'None' THEN 1 ELSE 0 END) AS reported_jank_frames,
+        ROUND(
+          100.0 * SUM(CASE WHEN dur > ${vsync_period_ns|16666667} * 1.5 THEN 1 ELSE 0 END) / MAX(COUNT(*), 1),
+          1
+        ) AS jank_rate_pct,
+        CASE
+          WHEN COUNT(*) > 0 AND MAX(ts + dur) > MIN(ts) THEN
+            ROUND(COUNT(*) * 1e9 / NULLIF(MAX(ts + dur) - MIN(ts), 0), 1)
+          ELSE 0
+        END AS estimated_fps
+      FROM flutter_frames
+    save_as: overview
+
+  # ========== Step 2: Flutter 线程耗时分析 ==========
+  - id: flutter_thread_analysis
+    type: atomic
+    name: "Flutter 线程耗时"
+    display:
+      level: detail
+      layer: list
+      title: "Flutter 线程耗时分布"
+      format: table
+    sql: |
+      WITH
+      -- Detect TextureView mode: 1.ui present + updateTexImage/SurfaceTexture slices > 5
+      textureview_check AS (
+        SELECT
+          (SELECT COUNT(DISTINCT t.utid) FROM thread t
+           JOIN process p ON t.upid = p.upid
+           WHERE t.name GLOB '*1.ui*'
+             AND ('${package}' = '' OR p.name LIKE '%${package}%')
+          ) as flutter_ui_threads,
+          (SELECT COUNT(*) FROM slice s
+           JOIN thread_track tt ON s.track_id = tt.id
+           JOIN thread t ON tt.utid = t.utid
+           WHERE (s.name GLOB '*updateTexImage*' OR s.name GLOB '*SurfaceTexture*')
+             AND s.dur > 0
+          ) as texture_view_slices
+      ),
+      is_textureview AS (
+        SELECT (flutter_ui_threads > 0 AND texture_view_slices > 5) as flag
+        FROM textureview_check
+      ),
+      -- Standard Flutter threads: 1.ui / 1.raster / 1.io
+      flutter_threads AS (
+        SELECT
+          CASE
+            WHEN t.name GLOB '*1.ui*' THEN 'UI (Dart)'
+            WHEN t.name GLOB '*1.raster*' THEN 'Raster (GPU)'
+            WHEN t.name GLOB '*1.io*' THEN 'IO (Decode)'
+          END AS role,
+          s.dur / 1e6 AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        WHERE ('${package}' = '' OR p.name LIKE '%${package}%')
+          AND (t.name GLOB '*1.ui*' OR t.name GLOB '*1.raster*' OR t.name GLOB '*1.io*')
+          AND s.dur > 0
+          AND (${start_ts} IS NULL OR s.ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR s.ts <= ${end_ts})
+      ),
+      -- TextureView mode: RenderThread composition (updateTexImage, DrawFrame, queueBuffer)
+      textureview_threads AS (
+        SELECT
+          'RenderThread (TextureView)' AS role,
+          s.dur / 1e6 AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        WHERE t.name = 'RenderThread'
+          AND (s.name GLOB '*updateTexImage*' OR s.name GLOB '*DrawFrame*' OR s.name GLOB '*queueBuffer*')
+          AND s.dur > 0
+          AND (${start_ts} IS NULL OR s.ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR s.ts <= ${end_ts})
+          AND (SELECT flag FROM is_textureview) = 1
+      ),
+      all_threads AS (
+        SELECT role, dur_ms FROM flutter_threads
+        UNION ALL
+        SELECT role, dur_ms FROM textureview_threads
+      )
+      SELECT
+        role,
+        COUNT(*) AS slice_count,
+        ROUND(AVG(dur_ms), 2) AS avg_ms,
+        ROUND(MAX(dur_ms), 2) AS max_ms,
+        ROUND(SUM(dur_ms), 1) AS total_ms,
+        SUM(CASE WHEN dur_ms > (${vsync_period_ns|16666667} / 1e6 * 1.5) THEN 1 ELSE 0 END) AS over_budget_count
+      FROM all_threads
+      GROUP BY role
+      ORDER BY total_ms DESC
+
+  # ========== Step 2.5: Flutter 消费端掉帧检测 ==========
+  - id: flutter_consumer_jank
+    type: atomic
+    name: "Flutter 消费端掉帧检测"
+    display:
+      level: summary
+      layer: overview
+      title: "Flutter 掉帧类型分布（消费端验证）"
+      format: table
+      columns:
+        - name: jank_type
+          label: "掉帧类型"
+          type: string
+        - name: count
+          label: "帧数"
+          type: number
+          format: compact
+        - name: real_jank_count
+          label: "实际掉帧"
+          type: number
+          format: compact
+        - name: hidden_jank_count
+          label: "隐藏掉帧"
+          type: number
+          format: compact
+        - name: false_positive
+          label: "假阳性"
+          type: number
+        - name: avg_dur
+          label: "平均耗时"
+          type: duration
+          format: duration_ms
+          unit: ns
+        - name: responsibility
+          label: "类型标签"
+          type: string
+    sql: |
+      WITH
+      vsync_intervals AS (
+        SELECT
+          c.ts - LAG(c.ts) OVER (ORDER BY c.ts) as interval_ns
+        FROM counter c
+        JOIN counter_track t ON c.track_id = t.id
+        WHERE t.name = 'VSYNC-sf'
+          AND (${start_ts} IS NULL OR c.ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR c.ts < ${end_ts})
+      ),
+      vsync_config AS (
+        SELECT CASE
+          WHEN raw_ns BETWEEN 5500000 AND 6500000 THEN 6060606
+          WHEN raw_ns BETWEEN 6500001 AND 7500000 THEN 6944444
+          WHEN raw_ns BETWEEN 7500001 AND 9500000 THEN 8333333
+          WHEN raw_ns BETWEEN 9500001 AND 12500000 THEN 11111111
+          WHEN raw_ns BETWEEN 12500001 AND 20000000 THEN 16666667
+          WHEN raw_ns BETWEEN 20000001 AND 35000000 THEN 33333333
+          ELSE raw_ns
+        END AS vsync_period_ns
+        FROM (
+          SELECT CAST(COALESCE(
+            (SELECT PERCENTILE(interval_ns, 0.5)
+             FROM vsync_intervals
+             WHERE interval_ns > 5500000 AND interval_ns < 50000000),
+            16666667
+          ) AS INTEGER) AS raw_ns
+        )
+      ),
+      flutter_app_frames AS (
+        SELECT
+          COALESCE(a.display_frame_token, a.surface_frame_token) as display_frame_token,
+          a.ts,
+          CASE WHEN a.dur > 0 THEN a.dur ELSE 0 END as dur,
+          COALESCE(a.jank_type, 'Unknown') as jank_type,
+          a.layer_name,
+          a.ts + CASE WHEN a.dur > 0 THEN a.dur ELSE 0 END as present_ts,
+          LAG(a.ts + CASE WHEN a.dur > 0 THEN a.dur ELSE 0 END)
+            OVER (PARTITION BY a.layer_name ORDER BY a.ts, COALESCE(a.display_frame_token, a.surface_frame_token)) as prev_present_ts
+        FROM actual_frame_timeline_slice a
+        LEFT JOIN process p ON a.upid = p.upid
+        WHERE (
+          '${package}' = '' OR p.name LIKE '%${package}%'
+        )
+          AND (${start_ts} IS NULL OR a.ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR a.ts < ${end_ts})
+          AND COALESCE(a.display_frame_token, a.surface_frame_token) IS NOT NULL
+      ),
+      jank_analysis AS (
+        SELECT
+          jank_type,
+          dur,
+          present_ts - prev_present_ts as interval_ns,
+          CASE
+            WHEN prev_present_ts IS NULL THEN 1
+            WHEN present_ts - prev_present_ts > (SELECT vsync_period_ns * 6 FROM vsync_config) THEN 1
+            ELSE 0
+          END as is_session_break,
+          CASE
+            WHEN prev_present_ts IS NULL THEN 0
+            WHEN present_ts - prev_present_ts > (SELECT vsync_period_ns * 6 FROM vsync_config) THEN 0
+            WHEN present_ts - prev_present_ts > (SELECT vsync_period_ns FROM vsync_config) * 1.5 THEN 1
+            ELSE 0
+          END as is_consumer_jank
+        FROM flutter_app_frames
+        WHERE prev_present_ts IS NOT NULL
+      )
+      SELECT
+        jank_type,
+        COUNT(*) as count,
+        -- 实际用户感知掉帧数（呈现间隔 > 1.5 * VSync）
+        SUM(is_consumer_jank) as real_jank_count,
+        -- 隐藏掉帧（jank_type=None 但消费端实际掉帧）
+        SUM(CASE WHEN jank_type = 'None' AND is_consumer_jank = 1 THEN 1 ELSE 0 END) as hidden_jank_count,
+        -- 假阳性（jank_type 报告掉帧，但消费端未跳帧）
+        SUM(CASE WHEN jank_type != 'None' AND is_consumer_jank = 0 THEN 1 ELSE 0 END) as false_positive,
+        CAST(ROUND(AVG(CASE WHEN dur > 0 THEN dur ELSE NULL END)) AS INTEGER) as avg_dur,
+        CASE
+          WHEN jank_type GLOB '*App*' OR jank_type = 'Self Jank' THEN '标签:App'
+          WHEN jank_type GLOB '*SurfaceFlinger*' THEN '标签:SurfaceFlinger'
+          WHEN jank_type GLOB '*Buffer*' THEN '标签:Buffer Stuffing(需验证)'
+          WHEN jank_type = 'None' THEN '标签:None(可能漏检)'
+          ELSE '标签:Other'
+        END as responsibility
+      FROM jank_analysis
+      WHERE is_session_break = 0
+      GROUP BY jank_type
+      ORDER BY real_jank_count DESC, count DESC
+      LIMIT 10
+    save_as: flutter_jank_stats
+
+  # ========== Step 3: Flutter 掉帧帧列表 ==========
+  - id: flutter_jank_frames
+    type: atomic
+    name: "Flutter 掉帧列表"
+    display:
+      level: detail
+      layer: list
+      title: "Flutter 掉帧帧列表 (按严重程度排序)"
+      format: table
+      columns:
+        - name: ts
+          type: timestamp
+          clickAction: navigate_timeline
+        - name: dur_ms
+          type: duration
+          format: duration_ms
+        - name: jank_level
+          type: string
+        - name: frames_dropped
+          type: number
+    sql: |
+      SELECT
+        printf('%d', a.ts) AS ts,
+        printf('%d', a.ts + a.dur) AS end_ts,
+        ROUND(a.dur / 1e6, 2) AS dur_ms,
+        CASE
+          WHEN a.dur > ${vsync_period_ns} * 3 THEN 'severe'
+          WHEN a.dur > ${vsync_period_ns} * 2 THEN 'bad'
+          WHEN a.dur > ${vsync_period_ns} * 1.5 THEN 'jank'
+          ELSE 'normal'
+        END AS jank_level,
+        ROUND(a.dur / CAST(${vsync_period_ns} AS REAL), 1) AS frames_dropped,
+        COALESCE(a.jank_tag, '') AS jank_tag
+      FROM actual_frame_timeline_slice a
+      LEFT JOIN process p ON a.upid = p.upid
+      WHERE (
+        '${package}' = '' OR p.name LIKE '%${package}%'
+      )
+      AND a.dur > ${vsync_period_ns} * 1.5
+      AND (${start_ts} IS NULL OR a.ts >= ${start_ts})
+      AND (${end_ts} IS NULL OR a.ts <= ${end_ts})
+      ORDER BY a.dur DESC
+      LIMIT 30
+    save_as: jank_frames
+
+  # ========== Step 4: UI 线程 (1.ui) 长帧分析 ==========
+  - id: flutter_ui_thread_long_slices
+    type: atomic
+    name: "UI 线程长耗时"
+    display:
+      level: detail
+      layer: list
+      title: "Flutter UI 线程 (1.ui) 长耗时 Slice"
+      format: table
+      columns:
+        - name: ts
+          type: timestamp
+          clickAction: navigate_timeline
+        - name: dur_ms
+          type: duration
+          format: duration_ms
+    sql: |
+      SELECT
+        s.name AS slice_name,
+        printf('%d', s.ts) AS ts,
+        ROUND(s.dur / 1e6, 2) AS dur_ms,
+        CASE
+          WHEN s.name LIKE '%BeginFrame%' THEN 'frame_build'
+          WHEN s.name LIKE '%Build%' THEN 'widget_build'
+          WHEN s.name LIKE '%Layout%' THEN 'layout'
+          WHEN s.name LIKE '%Paint%' THEN 'paint'
+          WHEN s.name LIKE '%Semantics%' THEN 'semantics'
+          ELSE 'other'
+        END AS category
+      FROM slice s
+      JOIN thread_track tt ON s.track_id = tt.id
+      JOIN thread t ON tt.utid = t.utid
+      JOIN process p ON t.upid = p.upid
+      WHERE (
+        '${package}' = '' OR p.name LIKE '%${package}%'
+      )
+      AND t.name GLOB '*1.ui*'
+      AND s.dur > ${vsync_period_ns}
+      AND s.depth = 0
+      AND (${start_ts} IS NULL OR s.ts >= ${start_ts})
+      AND (${end_ts} IS NULL OR s.ts <= ${end_ts})
+      ORDER BY s.dur DESC
+      LIMIT 20
+
+  # ========== Step 5: Raster 线程 (1.raster) 长帧分析 ==========
+  - id: flutter_raster_thread_long_slices
+    type: atomic
+    name: "Raster 线程长耗时"
+    display:
+      level: detail
+      layer: list
+      title: "Flutter Raster 线程 (1.raster) 长耗时 Slice"
+      format: table
+      columns:
+        - name: ts
+          type: timestamp
+          clickAction: navigate_timeline
+        - name: dur_ms
+          type: duration
+          format: duration_ms
+    sql: |
+      SELECT
+        s.name AS slice_name,
+        printf('%d', s.ts) AS ts,
+        ROUND(s.dur / 1e6, 2) AS dur_ms,
+        CASE
+          WHEN s.name LIKE '%DrawToSurface%' THEN 'draw_to_surface'
+          WHEN s.name LIKE '%EntityPass%' THEN 'impeller_render'
+          WHEN s.name LIKE '%SkGpu%' THEN 'skia_render'
+          WHEN s.name LIKE '%Compositor%' THEN 'compositor'
+          ELSE 'other'
+        END AS category
+      FROM slice s
+      JOIN thread_track tt ON s.track_id = tt.id
+      JOIN thread t ON tt.utid = t.utid
+      JOIN process p ON t.upid = p.upid
+      WHERE (
+        '${package}' = '' OR p.name LIKE '%${package}%'
+      )
+      AND t.name GLOB '*1.raster*'
+      AND s.dur > ${vsync_period_ns}
+      AND s.depth = 0
+      AND (${start_ts} IS NULL OR s.ts >= ${start_ts})
+      AND (${end_ts} IS NULL OR s.ts <= ${end_ts})
+      ORDER BY s.dur DESC
+      LIMIT 20

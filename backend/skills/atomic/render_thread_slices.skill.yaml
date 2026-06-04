@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+name: render_thread_slices
+version: "1.0"
+type: atomic
+category: rendering
+tier: B
+
+meta:
+  display_name: "渲染线程 Slice 分析"
+  description: "分析渲染线程的时间片分布"
+  icon: "brush"
+  tags: [rendering, thread, slice, atomic]
+  # ----- Phase F: pipeline-aware 接口标注 -----
+  pipeline_aware: true
+  pipeline_aware_note: |
+    "RenderThread"在不同 pipeline 是不同线程：
+    - 标准 HWUI: RenderThread
+    - Flutter: 1.raster
+    - Game: RHIThread (UE) / UnityGfx (Unity)
+    - WebView Functor: 宿主 RenderThread（含 Functor replay）
+    未来按 pipeline_id 切换 thread filter SQL。
+
+triggers:
+  keywords:
+    zh: [RenderThread, 渲染线程, 渲染 slice, GPU 指令, raster]
+    en: [renderthread, render thread, render slices, raster thread]
+  patterns:
+    - ".*(RenderThread|渲染线程|raster).*"
+    - ".*render.*(thread|slice).*"
+
+prerequisites:
+  required_tables:
+    - slice
+    - thread_track
+    - thread
+    - process
+  modules:
+    - slices.with_context
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: true
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: true
+    description: "分析结束时间戳(ns)"
+  - name: package
+    type: string
+    required: false
+    description: "应用包名"
+
+steps:
+  - id: render_slices
+    type: atomic
+    name: "RenderThread 耗时操作"
+    display:
+      level: key
+      title: "RenderThread 耗时操作"
+      columns:
+        - name: name
+          label: "操作"
+          type: string
+        - name: total_ms
+          label: "总耗时"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: count
+          label: "次数"
+          type: number
+          format: compact
+        - name: max_ms
+          label: "最大耗时"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: avg_ms
+          label: "平均耗时"
+          type: duration
+          format: duration_ms
+          unit: ms
+    sql: |
+      SELECT
+        name,
+        ROUND(SUM(dur) / 1e6, 2) as total_ms,
+        COUNT(*) as count,
+        ROUND(MAX(dur) / 1e6, 2) as max_ms,
+        ROUND(AVG(dur) / 1e6, 2) as avg_ms
+      FROM thread_slice
+      WHERE (process_name GLOB '${package}*' OR '${package}' = '')
+        AND thread_name = 'RenderThread'
+        AND ts >= ${start_ts}
+        AND ts < ${end_ts}
+        AND dur >= 500000
+      GROUP BY name
+      HAVING total_ms > 0.5
+      ORDER BY total_ms DESC
+      LIMIT 10
+    save_as: render_slices
+
+output:
+  format: structured

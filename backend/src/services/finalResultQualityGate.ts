@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Gracker (Chris)
+// This file is part of SmartPerfetto. See LICENSE for details.
+
+import type { AgentRuntimeAnalysisResult } from '../agent/core/orchestratorTypes';
+import { assessFinalReportContractCompleteness } from './finalReportContractGate';
+
+export type FinalResultQualityIssueCode =
+  | 'empty_conclusion'
+  | 'plan_summary_fallback'
+  | 'process_narration_conclusion'
+  | 'missing_final_report_heading'
+  | 'sparse_unverified_conclusion'
+  | 'scene_contract_incomplete';
+
+export interface FinalResultQualityIssue {
+  code: FinalResultQualityIssueCode;
+  message: string;
+}
+
+const FINAL_RESULT_QUALITY_GATE_MESSAGE =
+  '最终结果质量闸门发现 provider 没有产出可独立交付的完整结论；本次结果已标记为 partial，避免把降级文本当作正常完成。';
+
+const ANALYSIS_QUERY_MARKERS = [
+  '分析',
+  '诊断',
+  '为什么',
+  '原因',
+  '根因',
+  '卡顿',
+  '掉帧',
+  '慢',
+  '耗时高',
+  '瓶颈',
+  '性能问题',
+  'analyze',
+  'diagnose',
+  'why',
+  'root cause',
+  'performance issue',
+  'slow',
+  'bottleneck',
+  'jank',
+  'anr',
+];
+
+const DEEP_ANALYSIS_QUERY_MARKERS = [
+  '分析',
+  '诊断',
+  '为什么',
+  '原因',
+  '根因',
+  '性能问题',
+  'analyze',
+  'diagnose',
+  'why',
+  'root cause',
+  'performance issue',
+];
+
+const FACTUAL_QUERY_MARKERS = [
+  '哪个',
+  '哪一',
+  '是什么',
+  '多少',
+  '列出',
+  'package',
+  'pid',
+  'tid',
+  'what',
+  'which',
+  'how many',
+];
+
+function normalizeTextForQualityCheck(text: string): string {
+  return text.trim().replace(/\s+/g, ' ');
+}
+
+function countMatches(text: string, pattern: RegExp): number {
+  return text.match(pattern)?.length || 0;
+}
+
+function collectMarkdownSections(text: string): Array<{ heading: string; body: string }> {
+  const headingPattern = /(^|\n)\s*#{1,3}\s+([^\n]+)/g;
+  const matches = [...text.matchAll(headingPattern)];
+  return matches.map((match, index) => {
+    const headingStart = (match.index || 0) + match[1].length;
+    const bodyStart = headingStart + match[0].slice(match[1].length).length;
+    const nextStart = matches[index + 1]?.index ?? text.length;
+    return {
+      heading: match[2].trim(),
+      body: text.slice(bodyStart, nextStart).trim(),
+    };
+  });
+}
+
+function isFallbackSummaryHeading(heading: string): boolean {
+  const normalized = heading.trim().replace(/[：:]\s*$/, '').toLowerCase();
+  return normalized === '综合结论' ||
+    normalized === '分阶段证据摘要' ||
+    normalized === 'final conclusion' ||
+    normalized === 'evidence summary by phase';
+}
+
+function isHeadingLine(line: string, labelPattern: string): boolean {
+  return new RegExp(
+    `^\\s*(?:#{1,3}\\s*)?(?:${labelPattern})(?:\\s*[：:])?\\s*$`,
+    'i',
+  ).test(line);
+}
+
+function matchHeadingWithTail(line: string, labelPattern: string): string | undefined {
+  const match = line.match(new RegExp(
+    `^\\s*(?:#{1,6}\\s*)?(?:${labelPattern})(?:\\s*[：:])?\\s*(.*)$`,
+    'i',
+  ));
+  return match ? match[1].trim() : undefined;
+}
+
+function looksLikePhaseSummaryEntry(line: string): boolean {
+  return /^\s*(?:[-*]\s*|\d+[.)、]\s*)?[^：:\n]{1,80}[：:]\s+\S/.test(line);
+}
+
+function countPhaseSummaryEntries(text: string): number {
+  const lines = text.split(/\r?\n/);
+  let inPhaseSummary = false;
+  let count = 0;
+  for (const line of lines) {
+    const phaseSummaryTail = matchHeadingWithTail(line, '分阶段证据摘要|Evidence Summary By Phase');
+    if (phaseSummaryTail !== undefined) {
+      inPhaseSummary = true;
+      if (looksLikePhaseSummaryEntry(phaseSummaryTail)) count++;
+      continue;
+    }
+    if (!inPhaseSummary) continue;
+    if (/^\s*#{1,6}\s+\S/.test(line)) break;
+    if (looksLikePhaseSummaryEntry(line)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+function hasEvidenceReferenceText(text: string): boolean {
+  return countMatches(
+    text,
+    /(?:\bart-\d+\b|\bdata:[a-z0-9_:-]+\b|\bevidence[_-]?ref\b|\bsource_tool_call_id\b|证据\s*ID)/gi,
+  ) > 0;
+}
+
+function hasConcreteEvidenceText(text: string): boolean {
+  if (hasEvidenceReferenceText(text)) return true;
+
+  const metricCount = countMatches(
+    text,
+    /\b(?:TTID|dur(?:ation)?|self_ms|total_ms|Running|Runnable|blocked|binder|GC|CPU|Q[1-4][ab]?)\b|(?:\d+(?:\.\d+)?\s*(?:ms|s|%|fps|MB|GHz|MHz))/gi,
+  );
+  return metricCount >= 3;
+}
+
+function hasReportStructureMarker(text: string): boolean {
+  return /(^|\n)\s{0,3}#{1,6}\s+\S/.test(text) ||
+    /(^|\n)\s{0,3}\*\*[^*\n]{2,80}\*\*/.test(text) ||
+    /(^|\n)\s{0,3}\|/.test(text);
+}
+
+export function hasDeliverableFinalReportHeading(text: string): boolean {
+  return /(^|\n)\s{0,3}(?:#{1,3}\s*)?(?:(?:[^\n#]{0,40})?分析报告|综合结论|关键结论|最终结论|最终报告|根因分析|Final Conclusion|Final Report|Analysis Report|Root Cause)(?=\s|[：:。.!！?\n]|$)/i.test(text);
+}
+
+export function looksLikeProcessNarrationConclusion(conclusion: string): boolean {
+  const text = normalizeTextForQualityCheck(conclusion);
+  if (!text) return false;
+
+  return /^(?:我来|我需要|我将|我会|现在|接下来|下一步|让我|为了完成|I need\b|I will\b|Now I\b|Next\b|Let me\b)/i.test(text) ||
+    /(?:现在|接下来|下一步).{0,40}(?:完成|进入|继续).{0,20}Phase\s*\d+(?:\.\d+)?/i.test(text) ||
+    /(?:现在完成|现在进入|进入|继续执行).{0,20}Phase\s*\d+(?:\.\d+)?/i.test(text) ||
+    /(?:update_plan_phase|submit_plan|resolve_hypothesis|阶段状态更新|执行剩余阶段|继续执行剩余阶段|OpenAI plan|provider 未主动结束 stream|plan 未完成|plan 已完成)/i.test(text);
+}
+
+function collectIndependentEvidenceSectionText(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const sections: string[] = [];
+  let collecting = false;
+  const independentHeadingPattern =
+    '关键证据链|证据链|关键证据|根因拆解|优化建议|风险与不确定性|Evidence Chain|Key Evidence|Root Cause|Recommendations|Risks';
+
+  for (const line of lines) {
+    if (matchHeadingWithTail(line, '综合结论|Final Conclusion') !== undefined ||
+        matchHeadingWithTail(line, '分阶段证据摘要|Evidence Summary By Phase') !== undefined) {
+      collecting = false;
+      continue;
+    }
+
+    const independentTail = matchHeadingWithTail(line, independentHeadingPattern);
+    if (independentTail !== undefined) {
+      collecting = true;
+      if (independentTail) sections.push(independentTail);
+      continue;
+    }
+
+    if (collecting && (
+      /^\s*#{1,6}\s+\S/.test(line) ||
+      /^\s*\S.{0,60}[：:]\s*$/.test(line)
+    )) {
+      collecting = false;
+      continue;
+    }
+
+    if (collecting) sections.push(line);
+  }
+
+  return sections.join('\n').trim();
+}
+
+export function looksLikePhaseSummaryFallback(conclusion: string): boolean {
+  const text = conclusion.trim();
+  if (!text) return false;
+
+  const hasConclusionHeading = /(^|\n)\s*(?:#{1,3}\s*)?(综合结论|Final Conclusion)(?:\s*[：:])?/i.test(text);
+  const hasPhaseSummaryHeading = /(^|\n)\s*(?:#{1,3}\s*)?(分阶段证据摘要|Evidence Summary By Phase)(?:\s*[：:])?/i.test(text);
+  if (!hasConclusionHeading || !hasPhaseSummaryHeading) return false;
+
+  if (countPhaseSummaryEntries(text) < 1) return false;
+
+  const nonFallbackSections = collectMarkdownSections(text)
+    .filter(section => !isFallbackSummaryHeading(section.heading));
+  const independentEvidenceText = collectIndependentEvidenceSectionText(text);
+  if (independentEvidenceText && hasConcreteEvidenceText(independentEvidenceText)) {
+    return false;
+  }
+  if (nonFallbackSections.length === 0) return true;
+
+  return !hasConcreteEvidenceText(
+    nonFallbackSections.map(section => `${section.heading}\n${section.body}`).join('\n\n'),
+  );
+}
+
+function looksLikeAnalysisQuery(query: string | undefined): boolean {
+  const normalized = normalizeTextForQualityCheck(String(query || '')).toLowerCase();
+  if (!normalized) return true;
+  const asksFactualQuestion = FACTUAL_QUERY_MARKERS.some(marker => normalized.includes(marker));
+  const asksDeepAnalysis = DEEP_ANALYSIS_QUERY_MARKERS.some(marker => normalized.includes(marker));
+  if (asksFactualQuestion && !asksDeepAnalysis) return false;
+  return ANALYSIS_QUERY_MARKERS.some(marker => normalized.includes(marker));
+}
+
+function hasSupportedClaimVerification(result: AgentRuntimeAnalysisResult): boolean {
+  const status = result.claimVerificationResult?.status;
+  if (status === 'passed') return true;
+  if (status !== 'partial') return false;
+  return result.claimVerificationResult?.claimResults?.some(claim =>
+    claim.status === 'verified' || claim.status === 'partial' || claim.status === 'inference'
+  ) === true;
+}
+
+function conclusionContractHasEvidence(result: AgentRuntimeAnalysisResult): boolean {
+  const contract = result.conclusionContract;
+  if (!contract) return false;
+  if (Array.isArray(contract.evidenceChain) && contract.evidenceChain.length > 0) return true;
+  return Array.isArray(contract.claims) &&
+    contract.claims.some(claim =>
+      (Array.isArray(claim.references) && claim.references.length > 0) ||
+      (Array.isArray(claim.artifactRefs) && claim.artifactRefs.length > 0) ||
+      (Array.isArray(claim.relationRefs) && claim.relationRefs.length > 0)
+    );
+}
+
+function hasEvidenceBackedArtifacts(result: AgentRuntimeAnalysisResult): boolean {
+  return Boolean(
+    conclusionContractHasEvidence(result) ||
+    (Array.isArray(result.claimSupport) && result.claimSupport.some(claim =>
+      claim.supportLevel === 'verified' ||
+      claim.supportLevel === 'partial' ||
+      claim.supportLevel === 'inference'
+    )) ||
+    hasSupportedClaimVerification(result),
+  );
+}
+
+export function assessFinalResultQuality(input: {
+  result: AgentRuntimeAnalysisResult;
+  query?: string;
+  sceneType?: string;
+}): FinalResultQualityIssue | undefined {
+  const { result, query, sceneType } = input;
+  if (!result.success || result.partial === true) return undefined;
+
+  const conclusion = result.conclusion.trim();
+  if (!conclusion) {
+    return {
+      code: 'empty_conclusion',
+      message: FINAL_RESULT_QUALITY_GATE_MESSAGE,
+    };
+  }
+
+  if (looksLikePhaseSummaryFallback(conclusion)) {
+    return {
+      code: 'plan_summary_fallback',
+      message: FINAL_RESULT_QUALITY_GATE_MESSAGE,
+    };
+  }
+
+  if (looksLikeProcessNarrationConclusion(conclusion)) {
+    return {
+      code: 'process_narration_conclusion',
+      message: FINAL_RESULT_QUALITY_GATE_MESSAGE,
+    };
+  }
+
+  if (
+    looksLikeAnalysisQuery(query) &&
+    hasReportStructureMarker(conclusion) &&
+    !hasDeliverableFinalReportHeading(conclusion)
+  ) {
+    return {
+      code: 'missing_final_report_heading',
+      message: FINAL_RESULT_QUALITY_GATE_MESSAGE,
+    };
+  }
+
+  const hasFindings = Array.isArray(result.findings) && result.findings.length > 0;
+  if (
+    looksLikeAnalysisQuery(query) &&
+    conclusion.length < 280 &&
+    !hasFindings &&
+    !hasEvidenceBackedArtifacts(result) &&
+    !hasEvidenceReferenceText(conclusion)
+  ) {
+    return {
+      code: 'sparse_unverified_conclusion',
+      message: FINAL_RESULT_QUALITY_GATE_MESSAGE,
+    };
+  }
+
+  if (looksLikeAnalysisQuery(query)) {
+    const contractIssue = assessFinalReportContractCompleteness({
+      conclusion,
+      query,
+      sceneType,
+      contractSceneId: result.conclusionContract?.metadata?.sceneId,
+    });
+    if (contractIssue) {
+      const missingText = contractIssue.missingLabels.join('、');
+      return {
+        code: 'scene_contract_incomplete',
+        message: `${FINAL_RESULT_QUALITY_GATE_MESSAGE} ` +
+          `缺失 ${contractIssue.sceneType} 场景 Final Report Contract 要求的结构：${missingText}。`,
+      };
+    }
+  }
+
+  return undefined;
+}
+
+export function applyFinalResultQualityGate(input: {
+  result: AgentRuntimeAnalysisResult;
+  query?: string;
+  sceneType?: string;
+}): FinalResultQualityIssue | undefined {
+  const issue = assessFinalResultQuality(input);
+  if (!issue) return undefined;
+
+  input.result.partial = true;
+  input.result.confidence = Math.min(input.result.confidence || 0, 0.55);
+  input.result.terminationMessage = input.result.terminationMessage
+    ? `${input.result.terminationMessage}\n\n${issue.message}`
+    : issue.message;
+  return issue;
+}

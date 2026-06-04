@@ -1,0 +1,915 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# 点击响应分析 v2.2（组合 Skill）- 基于 Perfetto stdlib 优化版
+# =============================================================================
+# 使用 Perfetto stdlib 的 android_input_events 表进行深度分析
+#
+# v2.2 新增：
+# - Iterator 模式：逐个慢输入事件详细分析
+# - 大小核分析：输入处理期间 CPU 大小核占比
+# - 四大象限分析：Running/Runnable/Sleeping 状态分布
+# - Perfetto 跳转链接：点击跳转到输入事件区间
+#
+# 核心表：
+# - android_input_events: 输入事件完整延迟分解
+#   - dispatch_latency_dur: 系统分发延迟
+#   - handling_latency_dur: 应用处理延迟
+#   - ack_latency_dur: ACK 延迟
+#   - total_latency_dur: dispatch-to-ACK 总延迟
+#   - end_to_end_latency_dur: 输入到关联帧延迟（需要 frame_id/FrameTimeline）
+#   - frame_id: 关联的帧 ID
+# - android_motion_events: 触摸事件详情
+# - android_key_events: 按键事件详情
+
+name: click_response_analysis
+version: "1.0"
+type: composite
+category: interaction
+tier: S
+
+meta:
+  display_name: "点击响应分析"
+  description: "分析已完成 ACK 的点击事件响应延迟，并在有帧关联时补充 input-to-frame 延迟"
+  icon: "touch_app"
+  tags: [click, latency, interaction, composite]
+
+triggers:
+  keywords:
+    zh: [点击, 点击响应, 触摸, 输入延迟, 点击慢, 响应慢, 点击卡顿]
+    en: [click, tap, touch, input latency, response time, click delay]
+  patterns:
+    - ".*点击.*慢.*"
+    - ".*点击.*卡.*"
+    - ".*响应.*延迟.*"
+    - ".*input.*latency.*"
+
+prerequisites:
+  modules:
+    - android.input
+    - android.binder
+    - android.frames.timeline
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "应用包名（可选）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳（纳秒，可选）"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳（纳秒，可选）"
+  - name: slow_event_threshold_ms
+    type: number
+    required: false
+    default: 100
+    description: "慢输入事件阈值（ms，超过该值视为慢事件）"
+  - name: avg_latency_critical_ms
+    type: number
+    required: false
+    default: 100
+    description: "平均延迟-严重阈值（ms）"
+  - name: avg_handling_warning_ms
+    type: number
+    required: false
+    default: 50
+    description: "应用处理延迟-警告阈值（ms）"
+  - name: avg_dispatch_warning_ms
+    type: number
+    required: false
+    default: 20
+    description: "系统分发延迟-警告阈值（ms）"
+  - name: binder_blocking_threshold_ms
+    type: number
+    required: false
+    default: 30
+    description: "Binder 阻塞判定阈值（ms）"
+  - name: critical_event_threshold_ms
+    type: number
+    required: false
+    default: 200
+    description: "严重慢事件阈值（ms）"
+  - name: thread_state_min_dur_ms
+    type: number
+    required: false
+    default: 50
+    description: "线程状态分析最小输入延迟阈值（ms）"
+  - name: enable_per_event_detail
+    type: boolean
+    required: false
+    default: true
+    description: "是否启用逐事件详细分析（策略模式可关闭以避免重复）"
+
+steps:
+  # ========== 检查输入事件数据 ==========
+  - id: check_input_data
+    type: atomic
+    name: "检查输入事件数据"
+    optional: true
+    display:
+      level: summary
+      layer: overview
+      title: "数据检查"
+      columns:
+        - name: event_count
+          label: "事件数"
+          type: number
+          format: compact
+        - name: status
+          label: "状态"
+          type: string
+    sql: |
+      SELECT
+        COUNT(*) as event_count,
+        CASE WHEN COUNT(*) > 0 THEN 'available' ELSE 'unavailable' END as status
+      FROM android_input_events
+      WHERE (process_name GLOB '${package}*' OR '${package}' = '')
+        AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+        AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+    save_as: input_check
+
+  # ========== 选择目标进程（让分析更聚焦）==========
+  - id: get_process
+    type: atomic
+    name: "选择目标进程"
+    display:
+      level: summary
+      layer: overview
+      title: "目标进程"
+      columns:
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: event_count
+          label: "事件数"
+          type: number
+          format: compact
+        - name: max_total_ms
+          label: "最大延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+    sql: |
+      SELECT
+        process_name,
+        COUNT(*) as event_count,
+        ROUND(MAX(total_latency_dur) / 1e6, 2) as max_total_ms
+      FROM android_input_events
+      WHERE (process_name GLOB '${package}*' OR '${package}' = '')
+        AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+        AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+      GROUP BY process_name
+      ORDER BY event_count DESC, max_total_ms DESC
+      LIMIT 1
+    save_as: target_process
+    condition: input_check.data[0]?.status === 'available'
+
+  # ========== 输入延迟概览（使用 android_input_events）==========
+  - id: input_latency_overview
+    type: atomic
+    name: "输入延迟概览"
+    synthesize:
+      role: overview
+      fields:
+        - key: total_events
+          label: 事件总数
+        - key: avg_total_ms
+          label: 平均延迟
+          format: "{{value}} ms"
+        - key: max_total_ms
+          label: 最大延迟
+          format: "{{value}} ms"
+        - key: rating
+          label: 评级
+      insights:
+        - condition: "avg_total_ms > 100"
+          template: "平均输入延迟 {{avg_total_ms}}ms，超过 100ms 需优化"
+        - condition: "avg_handling_ms > avg_dispatch_ms"
+          template: "应用处理延迟 ({{avg_handling_ms}}ms) 高于系统分发 ({{avg_dispatch_ms}}ms)"
+    display:
+      level: key
+      layer: overview
+      title: "输入延迟概览"
+      columns:
+        - name: total_events
+          label: "事件总数"
+          type: number
+          format: compact
+        - name: avg_dispatch_ms
+          label: "平均分发延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: max_dispatch_ms
+          label: "最大分发延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: avg_handling_ms
+          label: "平均处理延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: max_handling_ms
+          label: "最大处理延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: avg_ack_ms
+          label: "平均 ACK 延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: avg_total_ms
+          label: "平均总延迟(ACK)"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: max_total_ms
+          label: "最大总延迟(ACK)"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: avg_e2e_ms
+          label: "平均 Input→Frame 延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: max_e2e_ms
+          label: "最大 Input→Frame 延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: rating
+          label: "评级"
+          type: string
+    sql: |
+      SELECT
+        COUNT(*) as total_events,
+        -- 分发延迟（系统责任）
+        ROUND(AVG(dispatch_latency_dur) / 1e6, 2) as avg_dispatch_ms,
+        ROUND(MAX(dispatch_latency_dur) / 1e6, 2) as max_dispatch_ms,
+        -- 处理延迟（应用责任）
+        ROUND(AVG(handling_latency_dur) / 1e6, 2) as avg_handling_ms,
+        ROUND(MAX(handling_latency_dur) / 1e6, 2) as max_handling_ms,
+        -- ACK 延迟
+        ROUND(AVG(ack_latency_dur) / 1e6, 2) as avg_ack_ms,
+        -- dispatch-to-ACK 总延迟
+        ROUND(AVG(total_latency_dur) / 1e6, 2) as avg_total_ms,
+        ROUND(MAX(total_latency_dur) / 1e6, 2) as max_total_ms,
+        -- 输入到关联帧延迟（需要 frame_id/FrameTimeline）
+        ROUND(AVG(end_to_end_latency_dur) / 1e6, 2) as avg_e2e_ms,
+        ROUND(MAX(end_to_end_latency_dur) / 1e6, 2) as max_e2e_ms,
+        -- 评级
+        CASE
+          WHEN AVG(total_latency_dur) / 1e6 < 50 THEN '优秀 (<50ms)'
+          WHEN AVG(total_latency_dur) / 1e6 < ${slow_event_threshold_ms|100} THEN '良好 (50-100ms)'
+          WHEN AVG(total_latency_dur) / 1e6 < ${critical_event_threshold_ms|200} THEN '可接受 (100-200ms)'
+          ELSE '较差 (>200ms)'
+        END as rating
+      FROM android_input_events
+      WHERE process_name = '${target_process.data[0].process_name}'
+        AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+        AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+    save_as: latency_overview
+    condition: input_check.data[0]?.status === 'available' && target_process.data.length > 0
+
+  # ========== 按事件类型分析 ==========
+  - id: latency_by_event_type
+    type: atomic
+    name: "按事件类型分析"
+    synthesize:
+      role: list
+      groupBy:
+        - field: event_type
+          title: 按事件类型分布
+      fields:
+        - key: event_action
+          label: 事件动作
+        - key: avg_latency_ms
+          label: 平均延迟
+          format: "{{value}} ms"
+        - key: slow_events
+          label: 慢事件数
+    display:
+      level: key
+      layer: overview
+      title: "各事件类型延迟"
+      columns:
+        - name: event_type
+          label: "事件类型"
+          type: string
+        - name: event_action
+          label: "事件动作"
+          type: string
+        - name: count
+          label: "次数"
+          type: number
+          format: compact
+        - name: avg_latency_ms
+          label: "平均延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: max_latency_ms
+          label: "最大延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: avg_handling_ms
+          label: "平均处理延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: slow_events
+          label: "慢事件数"
+          type: number
+    sql: |
+      SELECT
+        event_type,
+        event_action,
+        COUNT(*) as count,
+        ROUND(AVG(total_latency_dur) / 1e6, 2) as avg_latency_ms,
+        ROUND(MAX(total_latency_dur) / 1e6, 2) as max_latency_ms,
+        ROUND(AVG(handling_latency_dur) / 1e6, 2) as avg_handling_ms,
+        -- 慢事件数
+        SUM(CASE WHEN total_latency_dur / 1e6 > ${slow_event_threshold_ms|100} THEN 1 ELSE 0 END) as slow_events
+      FROM android_input_events
+      WHERE process_name = '${target_process.data[0].process_name}'
+        AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+        AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+      GROUP BY event_type, event_action
+      ORDER BY avg_latency_ms DESC
+    save_as: latency_by_type
+    condition: input_check.data[0]?.status === 'available' && target_process.data.length > 0
+
+  # ========== 按窗口分析（利用 normalized_event_channel）==========
+  - id: latency_by_window
+    type: atomic
+    name: "按窗口分析"
+    optional: true
+    synthesize:
+      role: list
+      groupBy:
+        - field: window
+          title: 按目标窗口分布
+      fields:
+        - key: avg_latency_ms
+          label: 平均延迟
+          format: "{{value}} ms"
+        - key: slow_events
+          label: 慢事件数
+    display:
+      level: key
+      layer: overview
+      title: "各窗口延迟"
+      columns:
+        - name: window
+          label: "窗口"
+          type: string
+        - name: count
+          label: "次数"
+          type: number
+          format: compact
+        - name: avg_latency_ms
+          label: "平均延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: max_latency_ms
+          label: "最大延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: avg_handling_ms
+          label: "平均处理延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: slow_events
+          label: "慢事件数"
+          type: number
+    sql: |
+      SELECT
+        normalized_event_channel as window,
+        COUNT(*) as count,
+        ROUND(AVG(total_latency_dur) / 1e6, 2) as avg_latency_ms,
+        ROUND(MAX(total_latency_dur) / 1e6, 2) as max_latency_ms,
+        ROUND(AVG(handling_latency_dur) / 1e6, 2) as avg_handling_ms,
+        SUM(CASE WHEN total_latency_dur / 1e6 > ${slow_event_threshold_ms|100} THEN 1 ELSE 0 END) as slow_events
+      FROM android_input_events
+      WHERE process_name = '${target_process.data[0].process_name}'
+        AND normalized_event_channel IS NOT NULL
+        AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+        AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+      GROUP BY normalized_event_channel
+      HAVING COUNT(*) > 1
+      ORDER BY avg_latency_ms DESC
+    save_as: latency_by_window
+    condition: input_check.data[0]?.status === 'available' && target_process.data.length > 0
+
+  # ========== 慢输入事件详情 ==========
+  - id: slow_input_events
+    type: atomic
+    name: "慢输入事件"
+    synthesize:
+      role: list
+      groupBy:
+        - field: main_bottleneck
+          title: 按延迟来源分布
+        - field: severity
+          title: 按严重程度分布
+      fields:
+        - key: event_type
+          label: 事件类型
+        - key: total_ms
+          label: 总延迟
+          format: "{{value}} ms"
+        - key: main_bottleneck
+          label: 瓶颈
+    display:
+      level: key
+      layer: list
+      title: "慢输入事件详情 (>100ms)"
+      columns:
+        - name: event_type
+          label: "事件类型"
+          type: string
+        - name: event_action
+          label: "事件动作"
+          type: string
+        - name: event_channel
+          label: "事件通道"
+          type: string
+        - name: normalized_channel
+          label: "窗口"
+          type: string
+        - name: total_ms
+          label: "总延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: dispatch_ms
+          label: "分发延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: handling_ms
+          label: "处理延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: ack_ms
+          label: "ACK 延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: e2e_ms
+          label: "Input→Frame 延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: thread_name
+          label: "线程"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: frame_id
+          label: "帧 ID"
+          type: number
+        - name: event_ts
+          label: "事件时间"
+          type: timestamp
+          clickAction: navigate_range
+          durationColumn: total_ms
+        - name: event_end_ts
+          label: "结束时间"
+          type: timestamp
+          clickAction: navigate_timeline
+          hidden: true
+        - name: perfetto_start
+          label: "Perfetto 开始"
+          type: timestamp
+          clickAction: navigate_timeline
+          hidden: true
+        - name: perfetto_end
+          label: "Perfetto 结束"
+          type: timestamp
+          clickAction: navigate_timeline
+          hidden: true
+        - name: severity
+          label: "严重程度"
+          type: enum
+        - name: main_bottleneck
+          label: "主要瓶颈"
+          type: string
+    sql: |
+      SELECT
+        event_type,
+        event_action,
+        event_channel,
+        normalized_event_channel as normalized_channel,
+        ROUND(total_latency_dur / 1e6, 2) as total_ms,
+        ROUND(dispatch_latency_dur / 1e6, 2) as dispatch_ms,
+        ROUND(handling_latency_dur / 1e6, 2) as handling_ms,
+        ROUND(ack_latency_dur / 1e6, 2) as ack_ms,
+        ROUND(end_to_end_latency_dur / 1e6, 2) as e2e_ms,
+        thread_name,
+        process_name,
+        frame_id,
+        -- 时间戳用于详细分析
+        printf('%d', dispatch_ts) as event_ts,
+        printf('%d', receive_ts + receive_dur) as event_end_ts,
+        -- Perfetto 跳转参数（前后各扩展 20ms）
+        printf('%d', CAST(dispatch_ts - 20000000 AS INTEGER)) as perfetto_start,
+        printf('%d', CAST(receive_ts + receive_dur + 20000000 AS INTEGER)) as perfetto_end,
+        CASE
+          WHEN total_latency_dur / 1e6 > ${critical_event_threshold_ms|200} THEN 'critical'
+          WHEN total_latency_dur / 1e6 > ${slow_event_threshold_ms|100} THEN 'warning'
+          ELSE 'notice'
+        END as severity,
+        -- 延迟主要来源
+        CASE
+          WHEN dispatch_latency_dur > handling_latency_dur AND dispatch_latency_dur > ack_latency_dur THEN '系统分发'
+          WHEN handling_latency_dur > ack_latency_dur THEN '应用处理'
+          ELSE 'ACK'
+        END as main_bottleneck
+      FROM android_input_events
+      WHERE process_name = '${target_process.data[0].process_name}'
+        AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+        AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+        AND total_latency_dur > ${slow_event_threshold_ms|100} * 1000000  -- > slow threshold
+      ORDER BY total_latency_dur DESC
+      LIMIT 20
+    save_as: slow_events
+    condition: input_check.data[0]?.status === 'available' && target_process.data.length > 0
+
+  # ========== 输入期间主线程状态分析（深度 JOIN）==========
+  - id: input_thread_state
+    type: atomic
+    name: "输入期间主线程状态"
+    optional: true
+    display:
+      level: detail
+      layer: list
+      title: "输入处理期间主线程状态"
+      columns:
+        - name: event_type
+          label: "事件类型"
+          type: string
+        - name: input_dur_ms
+          label: "输入延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: state
+          label: "线程状态"
+          type: string
+        - name: state_dur_ms
+          label: "状态持续时间"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: blocked_function
+          label: "阻塞函数"
+          type: string
+    sql: |
+      WITH main_thread AS (
+        SELECT t.utid, p.name as process_name
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE p.name = '${target_process.data[0].process_name}'
+          AND t.tid = p.pid
+        LIMIT 1
+      ),
+      slow_inputs AS (
+        SELECT
+          dispatch_ts as input_ts,
+          receive_ts + receive_dur as input_end_ts,
+          total_latency_dur,
+          event_type
+        FROM android_input_events
+        WHERE process_name = '${target_process.data[0].process_name}'
+          AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+          AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+          AND total_latency_dur > ${thread_state_min_dur_ms|50} * 1000000  -- > thread state threshold
+        ORDER BY total_latency_dur DESC
+        LIMIT 10
+      )
+      SELECT
+        si.event_type,
+        si.total_latency_dur / 1e6 as input_dur_ms,
+        ts.state,
+        SUM(
+          CASE
+            WHEN ts.ts + ts.dur <= si.input_ts THEN 0
+            WHEN ts.ts >= si.input_end_ts THEN 0
+            ELSE MIN(ts.ts + ts.dur, si.input_end_ts) - MAX(ts.ts, si.input_ts)
+          END
+        ) / 1e6 as state_dur_ms,
+        ts.blocked_function
+      FROM slow_inputs si
+      JOIN thread_state ts ON ts.utid = (SELECT utid FROM main_thread)
+      WHERE ts.ts + ts.dur > si.input_ts
+        AND ts.ts < si.input_end_ts
+      GROUP BY si.input_ts, ts.state, ts.blocked_function
+      ORDER BY si.total_latency_dur DESC, state_dur_ms DESC
+      LIMIT 30
+    save_as: input_thread_state
+    condition: input_check.data[0]?.status === 'available' && target_process.data.length > 0
+
+  # ========== 输入期间 Binder 调用 ==========
+  - id: input_binder_calls
+    type: atomic
+    name: "输入期间 Binder"
+    display:
+      level: detail
+      layer: list
+      title: "输入处理期间 Binder 调用"
+      columns:
+        - name: server_process
+          label: "服务进程"
+          type: string
+        - name: aidl_name
+          label: "AIDL 方法"
+          type: string
+        - name: call_count
+          label: "调用次数"
+          type: number
+          format: compact
+        - name: total_dur_ms
+          label: "总耗时"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: avg_dur_ms
+          label: "平均耗时"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: main_thread_calls
+          label: "主线程调用"
+          type: number
+    sql: |
+      WITH slow_inputs AS (
+        SELECT
+          dispatch_ts as input_ts,
+          receive_ts + receive_dur as input_end_ts,
+          total_latency_dur
+        FROM android_input_events
+        WHERE process_name = '${target_process.data[0].process_name}'
+          AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+          AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+          AND total_latency_dur > ${thread_state_min_dur_ms|50} * 1000000
+        ORDER BY total_latency_dur DESC
+        LIMIT 10
+      )
+      SELECT
+        bt.server_process,
+        bt.aidl_name,
+        COUNT(*) as call_count,
+        SUM(bt.client_dur) / 1e6 as total_dur_ms,
+        ROUND(AVG(bt.client_dur) / 1e6, 2) as avg_dur_ms,
+        SUM(CASE WHEN bt.is_main_thread THEN 1 ELSE 0 END) as main_thread_calls
+      FROM android_binder_txns bt
+      JOIN slow_inputs si ON (
+        bt.client_ts >= si.input_ts AND bt.client_ts < si.input_end_ts
+      )
+      WHERE bt.client_process = '${target_process.data[0].process_name}'
+        AND (${start_ts} IS NULL OR bt.client_ts + bt.client_dur > ${start_ts})
+        AND (${end_ts} IS NULL OR bt.client_ts < ${end_ts})
+      GROUP BY bt.server_process, bt.aidl_name
+      ORDER BY total_dur_ms DESC
+      LIMIT 15
+    save_as: input_binder
+    condition: input_check.data[0]?.status === 'available' && target_process.data.length > 0
+
+  # ========== 输入到帧关联分析 ==========
+  - id: input_to_frame
+    type: atomic
+    name: "输入到帧关联"
+    optional: true
+    display:
+      level: detail
+      layer: list
+      title: "输入到帧渲染延迟"
+      columns:
+        - name: event_type
+          label: "事件类型"
+          type: string
+        - name: event_action
+          label: "事件动作"
+          type: string
+        - name: e2e_latency_ms
+          label: "Input→Frame 延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: frame_id
+          label: "帧 ID"
+          type: number
+        - name: frame_dur_ms
+          label: "帧耗时"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: input_latency_ms
+          label: "Input ACK 延迟"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: rating
+          label: "评级"
+          type: enum
+    sql: |
+      SELECT
+        ie.event_type,
+        ie.event_action,
+        ie.end_to_end_latency_dur / 1e6 as e2e_latency_ms,
+        ie.frame_id,
+        -- 关联帧信息
+        af.dur / 1e6 as frame_dur_ms,
+        ie.total_latency_dur / 1e6 as input_latency_ms,
+        -- 输入到关联帧的延迟
+        CASE
+          WHEN ie.end_to_end_latency_dur / 1e6 > ${critical_event_threshold_ms|200} THEN 'critical'
+          WHEN ie.end_to_end_latency_dur / 1e6 > ${slow_event_threshold_ms|100} THEN 'warning'
+          WHEN ie.end_to_end_latency_dur / 1e6 > ${thread_state_min_dur_ms|50} THEN 'notice'
+          ELSE 'good'
+        END as rating
+      FROM android_input_events ie
+      LEFT JOIN android_frames af ON ie.frame_id = af.frame_id
+      WHERE ie.process_name = '${target_process.data[0].process_name}'
+        AND (${start_ts} IS NULL OR ie.receive_ts + ie.receive_dur > ${start_ts})
+        AND (${end_ts} IS NULL OR ie.dispatch_ts < ${end_ts})
+        AND ie.frame_id IS NOT NULL
+        AND ie.end_to_end_latency_dur > 0
+      ORDER BY ie.end_to_end_latency_dur DESC
+      LIMIT 20
+    save_as: input_to_frame
+    condition: input_check.data[0]?.status === 'available' && target_process.data.length > 0
+
+  # ========== 延迟分布分析 ==========
+  - id: latency_distribution
+    type: atomic
+    name: "延迟分布"
+    synthesize:
+      role: overview
+      fields:
+        - key: latency_bucket
+          label: 延迟区间
+        - key: count
+          label: 事件数
+        - key: percent
+          label: 占比
+          format: "{{value}}%"
+    display:
+      level: summary
+      layer: overview
+      title: "输入延迟分布"
+      columns:
+        - name: latency_bucket
+          label: "延迟区间"
+          type: string
+        - name: count
+          label: "事件数"
+          type: number
+          format: compact
+        - name: percent
+          label: "占比"
+          type: percentage
+          format: percentage
+    sql: |
+      SELECT
+        CASE
+          WHEN total_latency_dur / 1e6 < 16 THEN '<16ms (极快)'
+          WHEN total_latency_dur / 1e6 < 50 THEN '16-50ms (快)'
+          WHEN total_latency_dur / 1e6 < 100 THEN '50-100ms (正常)'
+          WHEN total_latency_dur / 1e6 < 200 THEN '100-200ms (慢)'
+          ELSE '>200ms (很慢)'
+        END as latency_bucket,
+        COUNT(*) as count,
+        ROUND(100.0 * COUNT(*) / (
+          SELECT COUNT(*) FROM android_input_events
+          WHERE process_name = '${target_process.data[0].process_name}'
+            AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+            AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+        ), 1) as percent
+      FROM android_input_events
+      WHERE process_name = '${target_process.data[0].process_name}'
+        AND (${start_ts} IS NULL OR receive_ts + receive_dur > ${start_ts})
+        AND (${end_ts} IS NULL OR dispatch_ts < ${end_ts})
+      GROUP BY latency_bucket
+      ORDER BY
+        CASE latency_bucket
+          WHEN '<16ms (极快)' THEN 1
+          WHEN '16-50ms (快)' THEN 2
+          WHEN '50-100ms (正常)' THEN 3
+          WHEN '100-200ms (慢)' THEN 4
+          ELSE 5
+        END
+    save_as: latency_distribution
+    condition: input_check.data[0]?.status === 'available' && target_process.data.length > 0
+
+  # ========== 逐个慢输入事件详细分析 ==========
+  - id: analyze_slow_events
+    type: iterator
+    name: "慢输入事件详细分析"
+    synthesize:
+      role: clusters
+      clusterBy: main_bottleneck
+    display:
+      level: key
+      layer: deep
+      title: "慢输入事件详细分析"
+    source: slow_events
+    item_skill: click_response_detail
+    item_params:
+      event_ts: event_ts
+      event_end_ts: event_end_ts
+      total_ms: total_ms
+      dispatch_ms: dispatch_ms
+      handling_ms: handling_ms
+      event_type: event_type
+      event_action: event_action
+      process_name: process_name
+      perfetto_start: perfetto_start
+      perfetto_end: perfetto_end
+    condition: slow_events.data.length > 0 && '${enable_per_event_detail|true}' !== 'false'
+
+  # ========== 点击响应诊断 ==========
+  - id: click_diagnosis
+    type: diagnostic
+    name: "点击响应诊断"
+    synthesize:
+      role: conclusion
+      fields:
+        - key: diagnosis
+          label: 诊断结论
+        - key: severity
+          label: 严重程度
+        - key: confidence
+          label: 置信度
+      insights:
+        - template: "点击响应诊断：{{diagnosis}}"
+    display:
+      level: key
+      layer: overview
+      title: "问题诊断"
+    inputs: [latency_overview, slow_events, input_thread_state, input_binder]
+    rules:
+      # 平均延迟过高
+      - condition: "latency_overview.data[0]?.avg_total_ms > ${avg_latency_critical_ms|100}"
+        severity: critical
+        diagnosis: "平均输入延迟过高 (${latency_overview.data[0].avg_total_ms}ms)"
+        confidence: high
+        suggestions:
+          - "检查主线程是否有耗时操作"
+          - "优化事件处理逻辑"
+          - "将耗时操作移到后台线程"
+
+      # 应用处理延迟高
+      - condition: "latency_overview.data[0]?.avg_handling_ms > ${avg_handling_warning_ms|50}"
+        severity: warning
+        diagnosis: "应用处理延迟偏高 (${latency_overview.data[0].avg_handling_ms}ms)"
+        confidence: high
+        suggestions:
+          - "优化 onClick/onTouchEvent 处理"
+          - "避免在事件处理中进行 IO 操作"
+
+      # 系统分发延迟高
+      - condition: "latency_overview.data[0]?.avg_dispatch_ms > ${avg_dispatch_warning_ms|20}"
+        severity: warning
+        diagnosis: "系统分发延迟偏高 (${latency_overview.data[0].avg_dispatch_ms}ms)"
+        confidence: medium
+        suggestions:
+          - "可能是系统负载过高"
+          - "检查输入系统是否有瓶颈"
+
+      # 存在严重慢事件
+      - condition: "slow_events.data[0]?.total_ms > ${critical_event_threshold_ms|200}"
+        severity: critical
+        diagnosis: "存在严重慢输入事件 (${slow_events.data[0].total_ms}ms)"
+        confidence: high
+        suggestions:
+          - "分析该事件期间主线程状态"
+          - "检查是否有 Binder/IO 阻塞"
+
+      # Binder 阻塞
+      - condition: "input_binder.data[0]?.total_dur_ms > ${binder_blocking_threshold_ms|30}"
+        severity: warning
+        diagnosis: "输入期间存在 Binder 阻塞 (${input_binder.data[0].total_dur_ms}ms)"
+        confidence: high
+        suggestions:
+          - "将 Binder 调用移到后台线程"
+          - "使用异步 Binder 接口"
+
+output:
+  format: structured

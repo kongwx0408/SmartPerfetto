@@ -1,0 +1,151 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# ANR Context in Range (Atomic Skill)
+# =============================================================================
+# Extracts the first ANR event data for use as a time-window anchor
+# in subsequent analysis steps. Replaces the `first_anr` CTE that was
+# duplicated 5× in anr_analysis.skill.yaml.
+#
+# Output fields used as parameters by consumers:
+#   - anr_ts: ANR timestamp (for window end)
+#   - timeout_ns: ANR timeout in nanoseconds (for window start = anr_ts - timeout_ns)
+#   - timeout_source: whether timeout_ns came from actual duration, stdlib default, or heuristic fallback
+#   - process_name, pid, upid, anr_type, error_id: ANR metadata
+#
+# Usage:
+#   - id: get_anr_context
+#     type: skill
+#     skill: anr_context_in_range
+#     params:
+#       process_name: "${process_name}"
+#       package: "${package}"
+#     save_as: anr_ctx
+#   Then use: ${anr_ctx.data[0].anr_ts}, ${anr_ctx.data[0].timeout_ns}
+# =============================================================================
+
+name: anr_context_in_range
+version: "1.0"
+type: atomic
+category: app_lifecycle
+tier: B
+
+meta:
+  display_name: "ANR 上下文提取"
+  description: "提取首个 ANR 事件的时间窗口参数，供后续分析步骤复用"
+  icon: "error"
+  tags: [anr, context, atomic]
+
+prerequisites:
+  modules:
+    - android.anrs
+
+inputs:
+  - name: process_name
+    type: string
+    required: false
+    description: "目标进程名"
+  - name: package
+    type: string
+    required: false
+    description: "应用包名（process_name 的别名）"
+  - name: anr_type
+    type: string
+    required: false
+    description: "ANR 类型过滤"
+
+display:
+  level: summary
+  layer: overview
+  title: "ANR 上下文"
+  columns:
+    - name: anr_ts
+      label: "ANR 时间"
+      type: timestamp
+      clickAction: navigate_timeline
+    - name: timeout_ns
+      label: "超时时长(ns)"
+      type: duration
+      unit: ns
+    - name: timeout_ms
+      label: "超时时长(ms)"
+      type: duration
+      format: duration_ms
+      unit: ms
+    - name: timeout_source
+      label: "超时来源"
+      type: string
+    - name: process_name
+      label: "进程名"
+      type: string
+    - name: upid
+      label: "UPID"
+      type: number
+    - name: anr_type
+      label: "ANR 类型"
+      type: string
+
+sql: |
+  WITH anr_events AS (
+    SELECT
+      ts,
+      process_name,
+      pid,
+      upid,
+      anr_type,
+      error_id,
+      default_anr_dur_ms,
+      NULLIF(anr_dur_ms, 0) AS actual_anr_dur_ms,
+      CASE
+        WHEN anr_type IN ('INPUT_DISPATCHING_TIMEOUT', 'INPUT_DISPATCHING_TIMEOUT_NO_FOCUSED_WINDOW') THEN 5000
+        WHEN anr_type = 'BROADCAST_OF_INTENT' THEN 10000
+        WHEN anr_type = 'EXECUTING_SERVICE' THEN 20000
+        WHEN anr_type IN ('START_FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_TIMEOUT') THEN 30000
+        WHEN anr_type = 'FOREGROUND_SHORT_SERVICE_TIMEOUT' THEN 180000
+        WHEN anr_type IN ('JOB_SERVICE_START', 'JOB_SERVICE_STOP', 'JOB_SERVICE_BIND', 'JOB_SERVICE_NOTIFICATION_NOT_PROVIDED') THEN 8000
+        WHEN anr_type = 'BIND_APPLICATION' THEN 15000
+        -- Perfetto default is NULL for these types. This value is an explicit
+        -- low-confidence lookback window so downstream SQL still has bounds.
+        WHEN anr_type IN ('CONTENT_PROVIDER_NOT_RESPONDING', 'GPU_HANG', 'APP_TRIGGERED', 'UNKNOWN_ANR_TYPE') THEN 5000
+        ELSE 5000
+      END AS heuristic_timeout_ms
+    FROM android_anrs
+    WHERE (
+        ('${process_name}' <> '' AND (process_name = '${process_name}' OR process_name GLOB '${process_name}:*'))
+        OR ('${package}' <> '' AND (process_name = '${package}' OR process_name GLOB '${package}:*'))
+        OR ('${process_name}' = '' AND '${package}' = '')
+      )
+      AND (anr_type = '${anr_type}' OR '${anr_type}' = '')
+  ),
+  normalized AS (
+    SELECT
+      *,
+      COALESCE(actual_anr_dur_ms, default_anr_dur_ms, heuristic_timeout_ms) AS timeout_ms,
+      CASE
+        WHEN actual_anr_dur_ms IS NOT NULL THEN 'actual_anr_duration'
+        WHEN default_anr_dur_ms IS NOT NULL THEN 'perfetto_default'
+        ELSE 'heuristic_fallback'
+      END AS timeout_source
+    FROM anr_events
+  )
+  SELECT
+    printf('%d', ts) as anr_ts,
+    printf('%d', CAST(timeout_ms * 1e6 AS INTEGER)) as timeout_ns,
+    ROUND(timeout_ms, 2) as timeout_ms,
+    timeout_source,
+    process_name,
+    pid,
+    upid,
+    anr_type,
+    error_id
+  FROM normalized
+  ORDER BY ts ASC
+  LIMIT 1
+
+save_as: first_anr
+optional: true
+
+output:
+  format: structured

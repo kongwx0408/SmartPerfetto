@@ -1,0 +1,24 @@
+{
+  "$schema": "internal://smartperfetto-sql-package",
+  "packageVersion": "0.1.0",
+  "symbols": [
+    {
+      "name": "smartperfetto.scrolling.jank_frames",
+      "sqlName": "smartperfetto_scrolling_jank_frames",
+      "kind": "view",
+      "module": "scrolling/jank_frames.sql",
+      "summary": "Janky-frame rows anchored on FrameTimeline jank_type (Spark Plan 10 dependency).",
+      "dependencies": ["android.frames.timeline"],
+      "stability": "experimental"
+    },
+    {
+      "name": "smartperfetto.binder.victim_to_server",
+      "sqlName": "smartperfetto_binder_victim_to_server",
+      "kind": "view",
+      "module": "binder/victim_to_server.sql",
+      "summary": "Binder client-server transaction pairs across processes (Spark Plan 12 dependency).",
+      "dependencies": ["android.binder"],
+      "stability": "experimental"
+    }
+  ]
+}

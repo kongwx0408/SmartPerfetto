@@ -1,0 +1,1609 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# ANR 事件详细分析 v3.0（组合 Skill）- 基于三篇专业文章重构
+# =============================================================================
+# 分析单个 ANR 事件的详细信息，用于定量分析：
+#
+# 1. 主线程四大象限分析（关键指标）：
+#    - Q1: Running on Big Core - 在大核上运行
+#    - Q2: Running on Little Core - 在小核上运行
+#    - Q3: Runnable - 等待 CPU 调度（CPU 资源争抢）
+#    - Q4: Sleeping/Blocked - 睡眠或阻塞（ANR 通常在这里）
+#
+# 2. RenderThread 分析（新增）：
+#    - nSyncDraw 阻塞
+#    - dequeueBuffer 阻塞
+#
+# 3. Binder 依赖分析：
+#    - 主线程发起的 Binder 调用
+#    - 被阻塞的 Binder 事务
+#
+# 4. 死锁检测（新增）：
+#    - Monitor 竞争分析
+#    - 互相等待检测
+#
+# 5. App Freeze 检测（新增）：
+#    - 应用是否完全冻结
+#    - 活动率分析
+
+name: anr_detail
+version: "2.0"
+type: composite
+category: app_lifecycle
+tier: S
+
+meta:
+  display_name: "ANR 详情分析"
+  description: "深入分析单个 ANR 事件的原因"
+  icon: "find_in_page"
+  tags: [anr, detail, composite]
+
+prerequisites:
+  required_tables:
+    - slice
+    - process
+  modules:
+    - android.binder
+    - linux.cpu.frequency
+    - android.monitor_contention
+
+inputs:
+  - name: anr_ts
+    type: timestamp
+    required: true
+    description: "ANR 发生时间戳(ns)"
+  - name: timeout_ns
+    type: timestamp
+    required: true
+    description: "ANR 超时时间(ns)"
+  - name: process_name
+    type: string
+    required: true
+    description: "进程名"
+  - name: pid
+    type: integer
+    required: true
+    description: "进程 ID"
+  - name: upid
+    type: integer
+    required: false
+    default: 0
+    description: "Trace 内唯一进程 ID；优先用于逐 ANR 进程隔离"
+  - name: anr_type
+    type: string
+    required: true
+    description: "ANR 类型"
+  - name: error_id
+    type: string
+    required: false
+    description: "ANR error_id（用于逐事件证据隔离）"
+  - name: intent
+    type: string
+    required: false
+    description: "ANR intent（如果 Perfetto 可提取）"
+  - name: component
+    type: string
+    required: false
+    description: "ANR component（如果 Perfetto 可提取）"
+  - name: anr_dur_ms
+    type: number
+    required: false
+    description: "ANR 持续时间(ms)"
+  - name: perfetto_start
+    type: timestamp
+    required: false
+    description: "Perfetto 跳转开始时间"
+  - name: perfetto_end
+    type: timestamp
+    required: false
+    description: "Perfetto 跳转结束时间"
+
+steps:
+  # ============================================================================
+  # CPU 拓扑视图初始化
+  # ============================================================================
+  - id: init_cpu_topology
+    type: skill
+    name: "初始化 CPU 拓扑"
+    skill: cpu_topology_view
+    display:
+      level: hidden
+    optional: true
+
+  # ============================================================================
+  # ANR 基本信息
+  # ============================================================================
+  - id: anr_info
+    type: atomic
+    name: "ANR 基本信息"
+    display:
+      level: key
+      layer: deep
+      title: "ANR 详情"
+      columns:
+        - name: process_name
+          label: "进程名"
+          type: string
+        - name: pid
+          label: "PID"
+          type: number
+        - name: upid
+          label: "UPID"
+          type: number
+        - name: anr_type
+          label: "ANR 类型"
+          type: string
+        - name: error_id
+          label: "Error ID"
+          type: string
+        - name: anr_dur_ms
+          label: "ANR 持续时间"
+          type: duration
+          format: duration_ms
+        - name: timeout_ms
+          label: "超时时间"
+          type: duration
+          format: duration_ms
+        - name: anr_ts
+          label: "ANR 时间"
+          type: timestamp
+          clickAction: navigate_timeline
+        - name: perfetto_start
+          label: "区间开始"
+          type: timestamp
+          clickAction: navigate_timeline
+        - name: perfetto_end
+          label: "区间结束"
+          type: timestamp
+          clickAction: navigate_timeline
+        - name: type_display
+          label: "类型说明"
+          type: string
+    sql: |
+      SELECT
+        '${process_name}' as process_name,
+        ${pid} as pid,
+        ${upid} as upid,
+        '${anr_type}' as anr_type,
+        '${error_id}' as error_id,
+        ROUND(COALESCE(${anr_dur_ms}, 0), 2) as anr_dur_ms,
+        ROUND(${timeout_ns} / 1e6, 2) as timeout_ms,
+        printf('%d', ${anr_ts}) as anr_ts,
+        printf('%d', COALESCE(${perfetto_start}, ${anr_ts} - ${timeout_ns})) as perfetto_start,
+        printf('%d', COALESCE(${perfetto_end}, ${anr_ts})) as perfetto_end,
+        CASE '${anr_type}'
+          WHEN 'INPUT_DISPATCHING_TIMEOUT' THEN '输入超时 (5s)'
+          WHEN 'INPUT_DISPATCHING_TIMEOUT_NO_FOCUSED_WINDOW' THEN '无焦点窗口输入超时 (5s)'
+          WHEN 'BROADCAST_OF_INTENT' THEN '广播超时'
+          WHEN 'START_FOREGROUND_SERVICE' THEN '前台服务启动超时'
+          WHEN 'EXECUTING_SERVICE' THEN '服务超时'
+          WHEN 'CONTENT_PROVIDER_NOT_RESPONDING' THEN 'CP超时'
+          WHEN 'JOB_SERVICE_START' THEN 'JobService onStartJob 超时'
+          WHEN 'JOB_SERVICE_STOP' THEN 'JobService onStopJob 超时'
+          WHEN 'JOB_SERVICE_BIND' THEN 'JobService bind 超时'
+          WHEN 'SYSTEM_SERVER_WATCHDOG_TIMEOUT' THEN 'system_server Watchdog 超时'
+          WHEN 'GPU_HANG' THEN 'GPU Hang'
+          ELSE '${anr_type}'
+        END as type_display
+    save_as: anr_basic
+
+  # ============================================================================
+  # 主线程四大象限分析（核心指标）
+  # ============================================================================
+  - id: main_thread_quadrant
+    type: atomic
+    name: "主线程四象限分析"
+    optional: true
+    display:
+      level: key
+      layer: deep
+      title: "主线程状态分布"
+      columns:
+        - name: q1_big_running_ms
+          label: "Q1大核运行(ms)"
+          type: number
+        - name: q2_little_running_ms
+          label: "Q2小核运行(ms)"
+          type: number
+        - name: q3_runnable_ms
+          label: "Q3可运行等待(ms)"
+          type: number
+        - name: q4_sleeping_ms
+          label: "Q4睡眠阻塞(ms)"
+          type: number
+        - name: total_ms
+          label: "总时长(ms)"
+          type: number
+        - name: running_pct
+          label: "Running占比(%)"
+          type: percentage
+          format: percentage
+        - name: runnable_pct
+          label: "Runnable占比(%)"
+          type: percentage
+          format: percentage
+        - name: sleeping_pct
+          label: "Sleeping占比(%)"
+          type: percentage
+          format: percentage
+        - name: status_verdict
+          label: "状态判断"
+          type: string
+    sql: |
+      WITH
+      main_thread AS (
+        SELECT t.utid, t.tid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE (
+            (${upid} > 0 AND p.upid = ${upid})
+            OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
+                AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+            OR (${upid} <= 0 AND ${pid} <= 0
+                AND (p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+          )
+          AND t.tid = p.pid
+        LIMIT 1
+      ),
+      anr_window AS (
+        SELECT
+          ${anr_ts} - ${timeout_ns} as start_ts,
+          ${anr_ts} as end_ts,
+          ${timeout_ns} as window_ns
+      ),
+      thread_states AS (
+        SELECT
+          ts.state,
+          COALESCE(ct.core_type, 'unknown') as core_type,
+          ts.blocked_function,
+          SUM(
+            MIN(CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END, aw.end_ts)
+              - MAX(ts.ts, aw.start_ts)
+          ) as dur_ns
+        FROM thread_state ts
+        JOIN main_thread mt ON ts.utid = mt.utid
+        CROSS JOIN anr_window aw
+        LEFT JOIN _cpu_topology ct ON ts.cpu = ct.cpu_id
+        WHERE ts.ts < aw.end_ts
+          AND (CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END) > aw.start_ts
+        GROUP BY ts.state, ct.core_type, ts.blocked_function
+      ),
+      quadrant_data AS (
+        SELECT
+          CASE
+            WHEN state = 'Running' AND core_type IN ('prime', 'big') THEN 'Q1_big_running'
+            WHEN state = 'Running' AND core_type IN ('medium', 'little') THEN 'Q2_little_running'
+            WHEN state IN ('R', 'R+') THEN 'Q3_runnable'
+            WHEN state IN ('S', 'D', 'I') THEN 'Q4_sleeping'
+            ELSE 'other'
+          END as quadrant,
+          dur_ns,
+          blocked_function
+        FROM thread_states
+      )
+      SELECT
+        ROUND(SUM(CASE WHEN quadrant = 'Q1_big_running' THEN dur_ns ELSE 0 END) / 1e6, 2) as q1_big_running_ms,
+        ROUND(SUM(CASE WHEN quadrant = 'Q2_little_running' THEN dur_ns ELSE 0 END) / 1e6, 2) as q2_little_running_ms,
+        ROUND(SUM(CASE WHEN quadrant = 'Q3_runnable' THEN dur_ns ELSE 0 END) / 1e6, 2) as q3_runnable_ms,
+        ROUND(SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ns ELSE 0 END) / 1e6, 2) as q4_sleeping_ms,
+        -- 总和与百分比
+        ROUND(SUM(dur_ns) / 1e6, 2) as total_ms,
+        ROUND(100.0 * SUM(CASE WHEN quadrant IN ('Q1_big_running', 'Q2_little_running') THEN dur_ns ELSE 0 END) /
+              NULLIF(SUM(dur_ns), 0), 1) as running_pct,
+        ROUND(100.0 * SUM(CASE WHEN quadrant = 'Q3_runnable' THEN dur_ns ELSE 0 END) /
+              NULLIF(SUM(dur_ns), 0), 1) as runnable_pct,
+        ROUND(100.0 * SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ns ELSE 0 END) /
+              NULLIF(SUM(dur_ns), 0), 1) as sleeping_pct,
+        -- 状态判断
+        CASE
+          WHEN 100.0 * SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ns ELSE 0 END) /
+               NULLIF(SUM(dur_ns), 0) > 80 THEN 'blocked'
+          WHEN 100.0 * SUM(CASE WHEN quadrant = 'Q3_runnable' THEN dur_ns ELSE 0 END) /
+               NULLIF(SUM(dur_ns), 0) > 30 THEN 'cpu_starved'
+          WHEN 100.0 * SUM(CASE WHEN quadrant IN ('Q1_big_running', 'Q2_little_running') THEN dur_ns ELSE 0 END) /
+               NULLIF(SUM(dur_ns), 0) > 70 THEN 'busy_running'
+          ELSE 'mixed'
+        END as status_verdict
+      FROM quadrant_data
+    save_as: quadrant
+
+  # ============================================================================
+  # 主线程阻塞原因 Top10（详细）
+  # ============================================================================
+  - id: blocking_reasons
+    type: skill
+    name: "阻塞原因分析"
+    skill: main_thread_states_in_range
+    display:
+      level: key
+      layer: deep
+      title: "阻塞原因 Top10"
+    params:
+      start_ts: "${anr_ts - timeout_ns}"
+      end_ts: "${anr_ts}"
+      upid: "${upid}"
+      pid: "${pid}"
+      package: "${process_name}"
+      top_k: 10
+    save_as: blocking
+
+  # ============================================================================
+  # RenderThread 分析（新增 - nSyncDraw/dequeueBuffer 阻塞）
+  # ============================================================================
+  - id: render_thread_analysis
+    type: atomic
+    name: "RenderThread 分析"
+    display:
+      level: key
+      layer: deep
+      title: "RenderThread 状态"
+      columns:
+        - name: type
+          label: "类型"
+          type: string
+        - name: name
+          label: "名称"
+          type: string
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+        - name: pct
+          label: "占比"
+          type: percentage
+          format: percentage
+    sql: |
+      WITH render_thread AS (
+        SELECT t.utid, t.tid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE (
+            (${upid} > 0 AND p.upid = ${upid})
+            OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
+                AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+            OR (${upid} <= 0 AND ${pid} <= 0
+                AND (p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+          )
+          AND t.name = 'RenderThread'
+        LIMIT 1
+      ),
+      anr_window AS (
+        SELECT
+          ${anr_ts} - ${timeout_ns} as start_ts,
+          ${anr_ts} as end_ts
+      ),
+      rt_states AS (
+        SELECT
+          ts.state,
+          ts.blocked_function,
+          SUM(
+            MIN(CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END, aw.end_ts)
+              - MAX(ts.ts, aw.start_ts)
+          ) as dur_ns
+        FROM thread_state ts
+        JOIN render_thread rt ON ts.utid = rt.utid
+        CROSS JOIN anr_window aw
+        WHERE ts.ts < aw.end_ts
+          AND (CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END) > aw.start_ts
+        GROUP BY ts.state, ts.blocked_function
+      ),
+      rt_slices AS (
+        SELECT
+          s.name,
+          SUM(
+            MIN(CASE WHEN s.dur < 0 THEN aw.end_ts ELSE s.ts + s.dur END, aw.end_ts)
+              - MAX(s.ts, aw.start_ts)
+          ) as dur_ns,
+          COUNT(*) as count
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN render_thread rt ON tt.utid = rt.utid
+        CROSS JOIN anr_window aw
+        WHERE s.ts < aw.end_ts
+          AND (CASE WHEN s.dur < 0 THEN aw.end_ts ELSE s.ts + s.dur END) > aw.start_ts
+          AND (s.name LIKE '%nSyncDraw%' OR s.name LIKE '%dequeueBuffer%'
+               OR s.name LIKE '%DrawFrame%' OR s.name LIKE '%syncFrameState%')
+        GROUP BY s.name
+      )
+      SELECT
+        'state' as type,
+        COALESCE(blocked_function, state) as name,
+        ROUND(dur_ns / 1e6, 2) as dur_ms,
+        ROUND(100.0 * dur_ns / ${timeout_ns}, 1) as pct
+      FROM rt_states
+      WHERE dur_ns > 1000000  -- > 1ms
+      UNION ALL
+      SELECT
+        'slice' as type,
+        name,
+        ROUND(dur_ns / 1e6, 2) as dur_ms,
+        ROUND(100.0 * dur_ns / ${timeout_ns}, 1) as pct
+      FROM rt_slices
+      WHERE dur_ns > 1000000
+      ORDER BY dur_ms DESC
+      LIMIT 10
+    save_as: render_thread
+    optional: true
+
+  # ============================================================================
+  # Binder 调用分析（主线程发起）
+  # ============================================================================
+  - id: binder_calls
+    type: skill
+    name: "Binder 调用分析"
+    skill: binder_in_range
+    display:
+      level: key
+      layer: deep
+      title: "Binder 调用"
+    params:
+      start_ts: "${anr_ts - timeout_ns}"
+      end_ts: "${anr_ts}"
+      package: "${process_name}"
+    save_as: binder_calls
+    optional: true
+
+  # ============================================================================
+  # 主线程同步 Binder 阻塞（补充佐证）
+  # ============================================================================
+  - id: main_thread_sync_binder
+    type: skill
+    name: "主线程同步 Binder"
+    skill: binder_blocking_in_range
+    display:
+      level: detail
+      layer: deep
+      title: "主线程同步 Binder"
+    params:
+      start_ts: "${anr_ts - timeout_ns}"
+      end_ts: "${anr_ts}"
+      package: "${process_name}"
+    save_as: main_sync_binder
+    optional: true
+
+  # ============================================================================
+  # 主线程调度延迟（补充佐证）
+  # ============================================================================
+  - id: sched_latency
+    type: skill
+    name: "调度延迟分析"
+    skill: main_thread_sched_latency_in_range
+    display:
+      level: detail
+      layer: deep
+      title: "主线程调度延迟"
+    params:
+      start_ts: "${anr_ts - timeout_ns}"
+      end_ts: "${anr_ts}"
+      package: "${process_name}"
+    save_as: sched_delay
+    optional: true
+
+  # ============================================================================
+  # 死锁/锁竞争检测（新增）
+  # ============================================================================
+  - id: lock_contention
+    type: atomic
+    name: "锁竞争检测"
+    display:
+      level: key
+      layer: deep
+      title: "锁竞争"
+      columns:
+        - name: blocking_method
+          label: "持锁方法"
+          type: string
+        - name: blocking_thread_name
+          label: "持锁线程"
+          type: string
+        - name: blocked_method
+          label: "等锁方法"
+          type: string
+        - name: blocked_thread_name
+          label: "等锁线程"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: blocked_type
+          label: "等锁类型"
+          type: string
+        - name: wait_ms
+          label: "等待时间"
+          type: duration
+          format: duration_ms
+        - name: waiter_count
+          label: "等待者数"
+          type: number
+          format: compact
+        - name: severity
+          label: "严重程度"
+          type: string
+    sql: |
+      WITH anr_window AS (
+        SELECT
+          ${anr_ts} - ${timeout_ns} as start_ts,
+          ${anr_ts} as end_ts
+      ),
+      clipped_contention AS (
+        SELECT
+          short_blocking_method,
+          blocking_thread_name,
+          short_blocked_method,
+          blocked_thread_name,
+          process_name,
+          is_blocked_thread_main,
+          waiter_count,
+          MIN(CASE WHEN dur < 0 THEN aw.end_ts ELSE ts + dur END, aw.end_ts)
+            - MAX(ts, aw.start_ts) AS clipped_ns
+        FROM android_monitor_contention
+        CROSS JOIN anr_window aw
+        WHERE ts < aw.end_ts
+          AND (CASE WHEN dur < 0 THEN aw.end_ts ELSE ts + dur END) > aw.start_ts
+          AND ('${process_name}' = '' OR process_name = '${process_name}')
+          AND is_blocked_thread_main = 1
+          AND (
+            MIN(CASE WHEN dur < 0 THEN aw.end_ts ELSE ts + dur END, aw.end_ts)
+              - MAX(ts, aw.start_ts)
+          ) >= 1000000  -- > 1ms inside the ANR window
+      )
+      SELECT
+        short_blocking_method as blocking_method,
+        blocking_thread_name,
+        short_blocked_method as blocked_method,
+        blocked_thread_name,
+        process_name,
+        CASE WHEN is_blocked_thread_main THEN 'MainThread' ELSE blocked_thread_name END as blocked_type,
+        ROUND(clipped_ns / 1e6, 2) as wait_ms,
+        waiter_count,
+        -- 判断严重程度
+        CASE
+          WHEN clipped_ns / 1e6 > 1000 THEN 'critical'
+          WHEN clipped_ns / 1e6 > 100 THEN 'warning'
+          ELSE 'info'
+        END as severity
+      FROM clipped_contention
+      ORDER BY clipped_ns DESC
+      LIMIT 10
+    save_as: lock_contention
+    optional: true
+
+  # ============================================================================
+  # 应用冻结检测（新增 - 检测应用是否完全冻结）
+  # ============================================================================
+  - id: app_freeze_check
+    type: atomic
+    name: "应用冻结检测"
+    optional: true
+    display:
+      level: detail
+      layer: deep
+      title: "应用活动状态"
+      columns:
+        - name: thread_type
+          label: "线程类型"
+          type: string
+        - name: running_ms
+          label: "运行时间"
+          type: duration
+          format: duration_ms
+        - name: total_ms
+          label: "总时间"
+          type: duration
+          format: duration_ms
+        - name: activity_pct
+          label: "活动率"
+          type: percentage
+          format: percentage
+        - name: status
+          label: "状态"
+          type: string
+    sql: |
+      WITH target_threads AS (
+        SELECT t.utid, t.tid, t.name as thread_name, p.pid,
+          CASE
+            WHEN t.tid = p.pid THEN 'MainThread'
+            WHEN t.name = 'RenderThread' THEN 'RenderThread'
+            WHEN t.name LIKE 'Binder:%' THEN 'Binder'
+            ELSE 'Other'
+          END as thread_type
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE (
+            (${upid} > 0 AND p.upid = ${upid})
+            OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
+                AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+            OR (${upid} <= 0 AND ${pid} <= 0
+                AND (p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+          )
+          AND (t.tid = p.pid OR t.name = 'RenderThread' OR t.name LIKE 'Binder:%')
+      ),
+      anr_window AS (
+        SELECT
+          ${anr_ts} - ${timeout_ns} as start_ts,
+          ${anr_ts} as end_ts
+      ),
+      thread_activity AS (
+        SELECT
+          tt.thread_type,
+          SUM(CASE WHEN ts.state = 'Running' THEN
+            MIN(CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END, aw.end_ts)
+              - MAX(ts.ts, aw.start_ts)
+          ELSE 0 END) as running_ns,
+          SUM(
+            MIN(CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END, aw.end_ts)
+              - MAX(ts.ts, aw.start_ts)
+          ) as total_ns
+        FROM thread_state ts
+        JOIN target_threads tt ON ts.utid = tt.utid
+        CROSS JOIN anr_window aw
+        WHERE ts.ts < aw.end_ts
+          AND (CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END) > aw.start_ts
+        GROUP BY tt.thread_type
+      )
+      SELECT
+        thread_type,
+        ROUND(running_ns / 1e6, 2) as running_ms,
+        ROUND(total_ns / 1e6, 2) as total_ms,
+        ROUND(100.0 * running_ns / NULLIF(total_ns, 0), 1) as activity_pct,
+        CASE
+          WHEN 100.0 * running_ns / NULLIF(total_ns, 0) < 5 THEN 'frozen'
+          WHEN 100.0 * running_ns / NULLIF(total_ns, 0) < 20 THEN 'low_activity'
+          ELSE 'active'
+        END as status
+      FROM thread_activity
+      ORDER BY
+        CASE thread_type
+          WHEN 'MainThread' THEN 1
+          WHEN 'RenderThread' THEN 2
+          WHEN 'Binder' THEN 3
+          ELSE 4
+        END
+    save_as: app_freeze_check
+
+  # ============================================================================
+  # 唤醒链分析（谁唤醒了主线程）
+  # ============================================================================
+  - id: wakeup_chain
+    type: atomic
+    name: "唤醒链分析"
+    display:
+      level: detail
+      layer: deep
+      title: "唤醒链"
+      columns:
+        - name: waker_thread
+          label: "唤醒线程"
+          type: string
+        - name: waker_process
+          label: "唤醒进程"
+          type: string
+        - name: blocked_function
+          label: "阻塞函数"
+          type: string
+        - name: wakeup_count
+          label: "唤醒次数"
+          type: number
+          format: compact
+        - name: avg_sleep_ms
+          label: "平均睡眠"
+          type: duration
+          format: duration_ms
+        - name: max_sleep_ms
+          label: "最大睡眠"
+          type: duration
+          format: duration_ms
+        - name: total_sleep_ms
+          label: "总睡眠"
+          type: duration
+          format: duration_ms
+    sql: |
+      WITH main_thread AS (
+        SELECT t.utid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE (
+            (${upid} > 0 AND p.upid = ${upid})
+            OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
+                AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+            OR (${upid} <= 0 AND ${pid} <= 0
+                AND (p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+          )
+          AND t.tid = p.pid
+        LIMIT 1
+      ),
+      anr_window AS (
+        SELECT
+          ${anr_ts} - ${timeout_ns} as start_ts,
+          ${anr_ts} as end_ts
+      )
+      SELECT
+        COALESCE(waker_thread.name, 'unknown') AS waker_thread,
+        COALESCE(waker_process.name, 'kernel') AS waker_process,
+        ts.blocked_function,
+        COUNT(*) AS wakeup_count,
+        ROUND(AVG(ts.dur) / 1e6, 2) AS avg_sleep_ms,
+        ROUND(MAX(ts.dur) / 1e6, 2) AS max_sleep_ms,
+        ROUND(SUM(ts.dur) / 1e6, 2) AS total_sleep_ms
+      FROM thread_state ts
+      JOIN main_thread mt ON ts.utid = mt.utid
+      CROSS JOIN anr_window aw
+      LEFT JOIN thread waker_thread ON ts.waker_utid = waker_thread.utid
+      LEFT JOIN process waker_process ON waker_thread.upid = waker_process.upid
+      WHERE ts.ts >= aw.start_ts
+        AND ts.ts < aw.end_ts
+        AND ts.state IN ('S', 'D', 'I')
+        AND ts.dur >= 1000000  -- > 1ms
+      GROUP BY waker_thread.name, waker_process.name, ts.blocked_function
+      ORDER BY total_sleep_ms DESC
+      LIMIT 10
+    save_as: wakeup
+    optional: true
+
+  # ============================================================================
+  # 主线程耗时 Slice（在做什么）
+  # ============================================================================
+  - id: main_thread_slices
+    type: skill
+    name: "主线程耗时操作"
+    skill: main_thread_slices_in_range
+    display:
+      level: detail
+      layer: deep
+      title: "主线程操作"
+    params:
+      start_ts: "${anr_ts - timeout_ns}"
+      end_ts: "${anr_ts}"
+      upid: "${upid}"
+      pid: "${pid}"
+      package: "${process_name}"
+      min_dur_ns: 1000000
+      top_k: 15
+    save_as: main_slices
+    optional: true
+
+  # ============================================================================
+  # 直接阻塞点候选分类（候选，不等于最终根因）
+  # ============================================================================
+  - id: thread_evidence_availability
+    type: atomic
+    name: "线程证据可用性"
+    optional: true
+    display:
+      level: hidden
+    sql: |
+      SELECT
+        CASE WHEN EXISTS (
+          SELECT 1 FROM sqlite_master
+          WHERE type IN ('table', 'view') AND name = 'thread_state'
+        ) THEN 1 ELSE 0 END AS has_thread_state,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM sqlite_master
+          WHERE type IN ('table', 'view') AND name = 'thread_track'
+        ) THEN 1 ELSE 0 END AS has_thread_track,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM sqlite_master
+          WHERE type IN ('table', 'view') AND name = 'slice'
+        ) THEN 1 ELSE 0 END AS has_slice
+    save_as: thread_evidence_availability
+
+  - id: direct_blocker_evidence_gap
+    type: atomic
+    name: "直接阻塞点证据缺口"
+    optional: true
+    display:
+      level: key
+      layer: deep
+      title: "直接阻塞点候选"
+      columns:
+        - name: direct_blocker_type
+          label: "直接阻塞类型"
+          type: string
+        - name: evidence_ms
+          label: "证据时长"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: pct_of_timeout
+          label: "超时占比"
+          type: percentage
+          format: percentage
+        - name: evidence_source
+          label: "证据来源"
+          type: string
+        - name: confidence
+          label: "置信度"
+          type: string
+        - name: root_cause_boundary
+          label: "责任边界"
+          type: string
+        - name: next_evidence_needed
+          label: "下一步证据"
+          type: string
+    condition: "thread_evidence_availability.data[0]?.has_thread_state !== 1"
+    sql: |
+      SELECT
+        'evidence_unavailable' AS direct_blocker_type,
+        0 AS evidence_ms,
+        0 AS pct_of_timeout,
+        'missing_thread_state' AS evidence_source,
+        'low' AS confidence,
+        'missing_thread_state_evidence' AS root_cause_boundary,
+        'Trace 缺少 thread_state，无法从主线程状态判断直接阻塞点；只能保留 trigger/logcat 为上下文证据' AS next_evidence_needed
+    save_as: direct_blocker_gap
+
+  - id: direct_blocker_classification
+    type: atomic
+    name: "直接阻塞点候选"
+    optional: true
+    display:
+      level: key
+      layer: deep
+      title: "直接阻塞点候选"
+      columns:
+        - name: direct_blocker_type
+          label: "直接阻塞类型"
+          type: string
+        - name: evidence_ms
+          label: "证据时长"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: pct_of_timeout
+          label: "超时占比"
+          type: percentage
+          format: percentage
+        - name: evidence_source
+          label: "证据来源"
+          type: string
+        - name: confidence
+          label: "置信度"
+          type: string
+        - name: root_cause_boundary
+          label: "责任边界"
+          type: string
+        - name: next_evidence_needed
+          label: "下一步证据"
+          type: string
+    condition: "thread_evidence_availability.data[0]?.has_thread_state === 1"
+    sql: |
+      WITH
+      anr_window AS (
+        SELECT
+          ${anr_ts} - ${timeout_ns} AS start_ts,
+          ${anr_ts} AS end_ts,
+          ${timeout_ns} AS window_ns
+      ),
+      main_thread AS (
+        SELECT t.utid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE (
+            (${upid} > 0 AND p.upid = ${upid})
+            OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
+                AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+            OR (${upid} <= 0 AND ${pid} <= 0
+                AND (p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+          )
+          AND t.tid = p.pid
+        LIMIT 1
+      ),
+      main_states AS (
+        SELECT
+          ts.state,
+          LOWER(COALESCE(ts.blocked_function, '')) AS blocked_function,
+          MIN(CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END, aw.end_ts) - MAX(ts.ts, aw.start_ts) AS clipped_ns
+        FROM thread_state ts
+        JOIN main_thread mt ON ts.utid = mt.utid
+        CROSS JOIN anr_window aw
+        WHERE ts.ts < aw.end_ts
+          AND (CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END) > aw.start_ts
+      ),
+      metrics AS (
+        SELECT
+          COALESCE((SELECT SUM(clipped_ns) FROM main_states
+            WHERE state IN ('S', 'D', 'I')
+              AND (blocked_function GLOB '*binder*' OR blocked_function GLOB '*ipc*')), 0) AS binder_wait_ns,
+          COALESCE((SELECT SUM(clipped_ns) FROM main_states
+            WHERE state IN ('S', 'D', 'I')
+              AND (blocked_function GLOB '*futex*' OR blocked_function GLOB '*mutex*'
+                   OR blocked_function GLOB '*monitor*' OR blocked_function GLOB '*rwsem*'
+                   OR blocked_function GLOB '*rwlock*')), 0) AS lock_wait_ns,
+          COALESCE((SELECT SUM(clipped_ns) FROM main_states
+            WHERE blocked_function GLOB '*io_schedule*'
+              OR blocked_function GLOB '*filemap_fault*'
+              OR blocked_function GLOB '*do_page_fault*'
+              OR blocked_function GLOB '*fsync*'
+              OR blocked_function GLOB '*blk*'
+              OR blocked_function GLOB '*ext4*'
+              OR blocked_function GLOB '*f2fs*'), 0) AS disk_wait_ns,
+          COALESCE((SELECT SUM(clipped_ns) FROM main_states
+            WHERE state = 'D'
+              AND NOT (
+                blocked_function GLOB '*io_schedule*'
+                OR blocked_function GLOB '*filemap_fault*'
+                OR blocked_function GLOB '*do_page_fault*'
+                OR blocked_function GLOB '*fsync*'
+                OR blocked_function GLOB '*blk*'
+                OR blocked_function GLOB '*ext4*'
+                OR blocked_function GLOB '*f2fs*'
+              )), 0) AS uninterruptible_wait_ns,
+          COALESCE((SELECT SUM(clipped_ns) FROM main_states
+            WHERE state IN ('S', 'D', 'I')
+              AND (blocked_function GLOB '*epoll*'
+                   OR blocked_function GLOB '*poll*'
+                   OR blocked_function GLOB '*do_epoll_wait*')), 0) AS poll_wait_ns,
+          COALESCE((SELECT SUM(clipped_ns) FROM main_states
+            WHERE state IN ('S', 'D', 'I')
+              AND (blocked_function GLOB '*nanosleep*'
+                   OR blocked_function GLOB '*hrtimer*'
+                   OR blocked_function GLOB '*sleep*')), 0) AS sleep_wait_ns,
+          COALESCE((SELECT SUM(clipped_ns) FROM main_states
+            WHERE state IN ('R', 'R+')), 0) AS runnable_ns,
+          COALESCE((SELECT SUM(clipped_ns) FROM main_states
+            WHERE state = 'Running'), 0) AS running_ns,
+          0 AS reserved_ns
+      ),
+      candidates AS (
+        SELECT 'binder_wait' AS direct_blocker_type, binder_wait_ns AS evidence_ns,
+          'thread_state.blocked_function' AS evidence_source,
+          CASE WHEN binder_wait_ns > 500000000 THEN 'high' ELSE 'medium' END AS confidence,
+          'needs_peer_evidence' AS root_cause_boundary,
+          '需要 Binder 对端进程/线程、server_dur 或 system_server 证据；不能只凭客户端等待定责' AS next_evidence_needed
+        FROM metrics WHERE binder_wait_ns > 0
+        UNION ALL
+        SELECT 'lock_or_futex_wait', lock_wait_ns, 'thread_state.blocked_function',
+          CASE WHEN lock_wait_ns > 500000000 THEN 'high' ELSE 'medium' END,
+          'needs_lock_owner_evidence',
+          '需要 monitor_contention/owner thread/锁链证据；普通 futex wait 只能说明候选锁等待'
+        FROM metrics WHERE lock_wait_ns > 0
+        UNION ALL
+        SELECT 'disk_or_page_fault_io', disk_wait_ns, 'thread_state.io_blocked_function',
+          CASE WHEN disk_wait_ns > 500000000 THEN 'high' ELSE 'medium' END,
+          'needs_io_system_context',
+          '需要 iowait、blk/mmc、文件/DB slice 或系统 IO 压力交叉验证'
+        FROM metrics WHERE disk_wait_ns > 0
+        UNION ALL
+        SELECT 'uninterruptible_wait', uninterruptible_wait_ns, 'thread_state.D_without_io_function',
+          'low',
+          'needs_kernel_wait_context',
+          'D-state 只能说明不可中断等待；缺少 IO blocked_function 或 slice 证据时不能归因为磁盘/页缺失'
+        FROM metrics WHERE uninterruptible_wait_ns > 0
+        UNION ALL
+        SELECT 'scheduler_pressure', runnable_ns, 'thread_state.R_or_R_plus',
+          CASE WHEN runnable_ns * 100.0 / NULLIF((SELECT window_ns FROM anr_window), 0) > 30 THEN 'medium' ELSE 'low' END,
+          'needs_system_load_context',
+          '需要 CPU health、Top CPU process、sched latency 交叉验证'
+        FROM metrics WHERE runnable_ns > 0
+        UNION ALL
+        SELECT 'cpu_busy_main_thread', running_ns, 'thread_state.Running',
+          CASE WHEN running_ns * 100.0 / NULLIF((SELECT window_ns FROM anr_window), 0) > 70 THEN 'medium' ELSE 'low' END,
+          'needs_hot_slice_context',
+          '需要主线程热点 slice/调用栈确认是否业务计算，不能只凭 Running 定责'
+        FROM metrics WHERE running_ns > 0
+        UNION ALL
+        SELECT 'native_poll_idle_or_ambiguous', poll_wait_ns, 'thread_state.blocked_function',
+          'low',
+          'not_root_cause_by_itself',
+          'nativePoll/epoll 只说明当前快照等待消息；需 EventLog/Logcat/窗口焦点或系统压力补证'
+        FROM metrics WHERE poll_wait_ns > 0
+        UNION ALL
+        SELECT 'main_thread_sleep', sleep_wait_ns, 'thread_state.blocked_function',
+          CASE WHEN sleep_wait_ns > 500000000 THEN 'medium' ELSE 'low' END,
+          'app_candidate_needs_stack_context',
+          '需要 Thread.sleep/wait 调用栈确认是否业务设计问题'
+        FROM metrics WHERE sleep_wait_ns > 0
+        UNION ALL
+        SELECT 'unknown', (SELECT window_ns FROM anr_window), 'no_direct_thread_state_or_slice_signal',
+          'low',
+          'unknown',
+          '当前 Perfetto 表未给出直接阻塞点；需要 ANR trace/logcat/EventLog 或更完整采集'
+        WHERE NOT EXISTS (
+          SELECT 1 FROM metrics
+          WHERE binder_wait_ns + lock_wait_ns + disk_wait_ns + uninterruptible_wait_ns
+            + runnable_ns + running_ns + poll_wait_ns + sleep_wait_ns > 0
+        )
+      )
+      SELECT
+        direct_blocker_type,
+        ROUND(evidence_ns / 1e6, 2) AS evidence_ms,
+        ROUND(100.0 * evidence_ns / NULLIF((SELECT window_ns FROM anr_window), 0), 1) AS pct_of_timeout,
+        evidence_source,
+        confidence,
+        root_cause_boundary,
+        next_evidence_needed
+      FROM candidates
+      ORDER BY
+        CASE confidence WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+        evidence_ns DESC
+      LIMIT 5
+    save_as: direct_blocker_candidates
+
+  - id: direct_blocker_slice_evidence_gap
+    type: atomic
+    name: "Slice 直接阻塞点证据缺口"
+    optional: true
+    display:
+      level: detail
+      layer: deep
+      title: "Slice 直接阻塞点候选"
+      columns:
+        - name: direct_blocker_type
+          label: "直接阻塞类型"
+          type: string
+        - name: evidence_ms
+          label: "证据时长"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: pct_of_timeout
+          label: "超时占比"
+          type: percentage
+          format: percentage
+        - name: evidence_source
+          label: "证据来源"
+          type: string
+        - name: confidence
+          label: "置信度"
+          type: string
+        - name: root_cause_boundary
+          label: "责任边界"
+          type: string
+        - name: next_evidence_needed
+          label: "下一步证据"
+          type: string
+    condition: "thread_evidence_availability.data[0]?.has_thread_state === 1 && (thread_evidence_availability.data[0]?.has_thread_track !== 1 || thread_evidence_availability.data[0]?.has_slice !== 1)"
+    sql: |
+      SELECT
+        'slice_evidence_unavailable' AS direct_blocker_type,
+        0 AS evidence_ms,
+        0 AS pct_of_timeout,
+        'missing_thread_track_or_slice' AS evidence_source,
+        'low' AS confidence,
+        'missing_slice_evidence' AS root_cause_boundary,
+        'Trace 缺少 thread_track/slice，无法从主线程或 RenderThread slice 判断 IO/GC/渲染候选；thread_state 直接阻塞点仍可使用' AS next_evidence_needed
+    save_as: direct_blocker_slice_gap
+
+  - id: direct_blocker_slice_classification
+    type: atomic
+    name: "Slice 直接阻塞点候选"
+    optional: true
+    condition: "thread_evidence_availability.data[0]?.has_thread_track === 1 && thread_evidence_availability.data[0]?.has_slice === 1"
+    display:
+      level: detail
+      layer: deep
+      title: "Slice 直接阻塞点候选"
+      columns:
+        - name: direct_blocker_type
+          label: "直接阻塞类型"
+          type: string
+        - name: evidence_ms
+          label: "证据时长"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: pct_of_timeout
+          label: "超时占比"
+          type: percentage
+          format: percentage
+        - name: evidence_source
+          label: "证据来源"
+          type: string
+        - name: confidence
+          label: "置信度"
+          type: string
+        - name: root_cause_boundary
+          label: "责任边界"
+          type: string
+        - name: next_evidence_needed
+          label: "下一步证据"
+          type: string
+    sql: |
+      WITH
+      anr_window AS (
+        SELECT
+          ${anr_ts} - ${timeout_ns} AS start_ts,
+          ${anr_ts} AS end_ts,
+          ${timeout_ns} AS window_ns
+      ),
+      main_thread AS (
+        SELECT t.utid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE (
+            (${upid} > 0 AND p.upid = ${upid})
+            OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
+                AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+            OR (${upid} <= 0 AND ${pid} <= 0
+                AND (p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+          )
+          AND t.tid = p.pid
+        LIMIT 1
+      ),
+      render_thread AS (
+        SELECT t.utid
+        FROM thread t
+        JOIN process p ON t.upid = p.upid
+        WHERE (
+            (${upid} > 0 AND p.upid = ${upid})
+            OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
+                AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+            OR (${upid} <= 0 AND ${pid} <= 0
+                AND (p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
+          )
+          AND t.name = 'RenderThread'
+        LIMIT 1
+      ),
+      main_slices AS (
+        SELECT
+          LOWER(s.name) AS slice_name,
+          MIN(CASE WHEN s.dur < 0 THEN aw.end_ts ELSE s.ts + s.dur END, aw.end_ts) - MAX(s.ts, aw.start_ts) AS clipped_ns
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN main_thread mt ON tt.utid = mt.utid
+        CROSS JOIN anr_window aw
+        WHERE s.ts < aw.end_ts
+          AND (CASE WHEN s.dur < 0 THEN aw.end_ts ELSE s.ts + s.dur END) > aw.start_ts
+      ),
+      render_slices AS (
+        SELECT
+          LOWER(s.name) AS slice_name,
+          MIN(CASE WHEN s.dur < 0 THEN aw.end_ts ELSE s.ts + s.dur END, aw.end_ts) - MAX(s.ts, aw.start_ts) AS clipped_ns
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN render_thread rt ON tt.utid = rt.utid
+        CROSS JOIN anr_window aw
+        WHERE s.ts < aw.end_ts
+          AND (CASE WHEN s.dur < 0 THEN aw.end_ts ELSE s.ts + s.dur END) > aw.start_ts
+      ),
+      metrics AS (
+        SELECT
+          COALESCE((SELECT SUM(clipped_ns) FROM main_slices
+            WHERE slice_name GLOB '*sqlite*'
+              OR slice_name GLOB '*database*'
+              OR slice_name GLOB '*fsync*'
+              OR slice_name GLOB '*fileio*'
+              OR slice_name GLOB '*file_io*'
+              OR slice_name GLOB '*disk*'
+              OR slice_name GLOB '*sharedpreferences*'
+              OR slice_name GLOB '*queuedwork*'), 0) AS main_io_slice_ns,
+          COALESCE((SELECT SUM(clipped_ns) FROM main_slices
+            WHERE slice_name GLOB '*gc*'
+              OR slice_name GLOB '*garbage*'
+              OR slice_name GLOB '*waitforgctocomplete*'
+              OR slice_name GLOB '*suspend*'), 0) AS gc_wait_ns,
+          COALESCE((SELECT SUM(clipped_ns) FROM main_slices
+            WHERE slice_name GLOB '*syncanddraw*'
+              OR slice_name GLOB '*waitforfence*'
+              OR slice_name GLOB '*dequeuebuffer*'
+              OR slice_name GLOB '*egl*'), 0) +
+          COALESCE((SELECT SUM(clipped_ns) FROM render_slices
+            WHERE slice_name GLOB '*syncanddraw*'
+              OR slice_name GLOB '*waitforfence*'
+              OR slice_name GLOB '*dequeuebuffer*'
+              OR slice_name GLOB '*drawframe*'
+              OR slice_name GLOB '*syncframestate*'), 0) AS render_wait_ns
+      ),
+      candidates AS (
+        SELECT 'db_or_file_io_slice' AS direct_blocker_type, main_io_slice_ns AS evidence_ns,
+          'main_thread_slice' AS evidence_source,
+          CASE WHEN main_io_slice_ns > 500000000 THEN 'medium' ELSE 'low' END AS confidence,
+          'app_candidate_needs_window_context' AS root_cause_boundary,
+          '需要确认该 IO slice 与 ANR 前窗口重叠，并结合系统 IO 压力判断是否被放大' AS next_evidence_needed
+        FROM metrics WHERE main_io_slice_ns > 0
+        UNION ALL
+        SELECT 'render_or_fence_wait', render_wait_ns, 'main_or_render_thread_slice',
+          CASE WHEN render_wait_ns > 500000000 THEN 'medium' ELSE 'low' END,
+          'needs_render_sf_evidence',
+          '需要 RenderThread、SurfaceFlinger、fence/buffer queue 证据闭环'
+        FROM metrics WHERE render_wait_ns > 0
+        UNION ALL
+        SELECT 'gc_or_stw_wait', gc_wait_ns, 'main_thread_slice',
+          CASE WHEN gc_wait_ns > 500000000 THEN 'medium' ELSE 'low' END,
+          'needs_memory_gc_evidence',
+          '需要 GC/logcat、PSI memory、LMK/OOM 或多线程暂停证据确认'
+        FROM metrics WHERE gc_wait_ns > 0
+      )
+      SELECT
+        direct_blocker_type,
+        ROUND(evidence_ns / 1e6, 2) AS evidence_ms,
+        ROUND(100.0 * evidence_ns / NULLIF((SELECT window_ns FROM anr_window), 0), 1) AS pct_of_timeout,
+        evidence_source,
+        confidence,
+        root_cause_boundary,
+        next_evidence_needed
+      FROM candidates
+      ORDER BY
+        CASE confidence WHEN 'medium' THEN 1 ELSE 2 END,
+        evidence_ns DESC
+      LIMIT 5
+    save_as: direct_blocker_slice_candidates
+
+  # ============================================================================
+  # 当前 ANR 附近 Logcat / AnrManager 上下文（逐 ANR，避免多事件串台）
+  # ============================================================================
+  - id: logcat_availability
+    type: atomic
+    name: "Logcat 表可用性"
+    display:
+      level: hidden
+    sql: |
+      SELECT
+        CASE WHEN EXISTS (
+          SELECT 1 FROM sqlite_master
+          WHERE type IN ('table', 'view') AND name = 'android_logs'
+        ) THEN 1 ELSE 0 END AS has_android_logs
+    save_as: logcat_availability
+    optional: true
+
+  - id: anr_logcat_evidence_gap
+    type: atomic
+    name: "当前 ANR 日志证据缺口"
+    optional: true
+    condition: "logcat_availability.data[0]?.has_android_logs !== 1"
+    display:
+      level: detail
+      layer: deep
+      title: "当前 ANR 日志上下文"
+      columns:
+        - name: error_id
+          label: "Error ID"
+          type: string
+        - name: signal_type
+          label: "信号类型"
+          type: string
+        - name: evidence_scope
+          label: "证据范围"
+          type: string
+        - name: root_cause_eligible
+          label: "可作根因证据"
+          type: boolean
+        - name: msg_preview
+          label: "消息"
+          type: string
+    sql: |
+      SELECT
+        '${error_id}' AS error_id,
+        'evidence_unavailable' AS signal_type,
+        'missing_source' AS evidence_scope,
+        0 AS root_cause_eligible,
+        'Trace 缺少 android_logs，无法用 Logcat/AnrManager 校验当前 ANR 触发上下文' AS msg_preview
+    save_as: logcat_context_gap
+
+  - id: anr_logcat_context
+    type: atomic
+    name: "当前 ANR 日志上下文"
+    optional: true
+    condition: "logcat_availability.data[0]?.has_android_logs === 1"
+    display:
+      level: detail
+      layer: deep
+      title: "当前 ANR 日志上下文"
+      columns:
+        - name: error_id
+          label: "Error ID"
+          type: string
+        - name: relation_to_anr_ms
+          label: "相对 ANR"
+          type: duration
+          format: duration_ms
+          unit: ms
+        - name: phase
+          label: "阶段"
+          type: string
+        - name: signal_type
+          label: "信号类型"
+          type: string
+        - name: evidence_scope
+          label: "证据范围"
+          type: string
+        - name: root_cause_eligible
+          label: "可作根因证据"
+          type: boolean
+        - name: prio
+          label: "级别"
+          type: string
+        - name: tag
+          label: "Tag"
+          type: string
+        - name: msg_preview
+          label: "消息"
+          type: string
+    sql: |
+      WITH anr_window AS (
+        SELECT
+          ${anr_ts} - ${timeout_ns} AS start_ts,
+          ${anr_ts} AS anr_ts,
+          ${anr_ts} + 5000000000 AS end_ts
+      ),
+      tagged AS (
+        SELECT
+          l.*,
+          CASE
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*inputdispatcher*' OR LOWER(COALESCE(l.msg, '')) GLOB '*input dispatch*' THEN 'input_dispatch'
+            WHEN LOWER(COALESCE(l.msg, '')) GLOB '*no focused window*' OR LOWER(COALESCE(l.msg, '')) GLOB '*no focus window*' THEN 'no_focus_window'
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*anrmanager*' THEN 'anrmanager'
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*activitymanager*' OR LOWER(COALESCE(l.tag, '')) GLOB '*activitytaskmanager*' THEN 'activity_manager'
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*windowmanager*' THEN 'window_manager'
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*broadcastqueue*' OR LOWER(COALESCE(l.msg, '')) GLOB '*broadcast*timeout*' THEN 'broadcast_timeout'
+            WHEN LOWER(COALESCE(l.msg, '')) GLOB '*executing service*' OR LOWER(COALESCE(l.msg, '')) GLOB '*foreground service*' THEN 'service_timeout'
+            WHEN LOWER(COALESCE(l.msg, '')) GLOB '*contentprovider*' OR LOWER(COALESCE(l.msg, '')) GLOB '*provider not responding*' THEN 'provider_timeout'
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*jobscheduler*' OR LOWER(COALESCE(l.msg, '')) GLOB '*jobservice*' THEN 'job_scheduler'
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*watchdog*' OR LOWER(COALESCE(l.msg, '')) GLOB '*system_server*watchdog*' THEN 'watchdog'
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*lmkd*' OR LOWER(COALESCE(l.tag, '')) GLOB '*lowmemorykiller*' OR LOWER(COALESCE(l.msg, '')) GLOB '*lowmemory*' THEN 'memory_pressure'
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*art*' OR LOWER(COALESCE(l.msg, '')) GLOB '*gc*' THEN 'gc_or_art'
+            WHEN LOWER(COALESCE(l.tag, '')) GLOB '*strictmode*'
+              OR LOWER(COALESCE(l.tag, '')) GLOB '*binder*'
+              OR LOWER(COALESCE(l.msg, '')) GLOB '*anr*'
+              OR LOWER(COALESCE(l.msg, '')) GLOB '*not responding*'
+              THEN 'anr_related'
+            ELSE 'other'
+          END AS signal_type
+        FROM android_logs l
+      ),
+      scoped AS (
+        SELECT
+          l.*,
+          CASE
+            WHEN '${process_name}' <> ''
+              AND LOWER(COALESCE(l.msg, '')) LIKE '%' || LOWER('${process_name}') || '%'
+              THEN 1 ELSE 0
+          END AS process_match,
+          CASE
+            WHEN '${component}' <> ''
+              AND LOWER(COALESCE(l.msg, '')) LIKE '%' || LOWER('${component}') || '%'
+              THEN 1 ELSE 0
+          END AS component_match,
+          CASE
+            WHEN '${intent}' <> ''
+              AND LOWER(COALESCE(l.msg, '')) LIKE '%' || LOWER('${intent}') || '%'
+              THEN 1 ELSE 0
+          END AS intent_match,
+          CASE
+            WHEN '${error_id}' <> ''
+              AND LOWER(COALESCE(l.msg, '')) LIKE '%' || LOWER('${error_id}') || '%'
+              THEN 1 ELSE 0
+          END AS error_match,
+          CASE
+            WHEN l.signal_type IN (
+              'input_dispatch',
+              'no_focus_window',
+              'anrmanager',
+              'activity_manager',
+              'window_manager',
+              'broadcast_timeout',
+              'service_timeout',
+              'provider_timeout',
+              'job_scheduler',
+              'watchdog',
+              'memory_pressure',
+              'gc_or_art',
+              'anr_related'
+            ) THEN 1 ELSE 0
+          END AS global_signal_match
+        FROM tagged l
+      )
+      SELECT
+        '${error_id}' AS error_id,
+        ROUND((l.ts - aw.anr_ts) / 1e6, 2) AS relation_to_anr_ms,
+        CASE
+          WHEN l.ts < aw.anr_ts THEN 'pre_anr'
+          WHEN l.ts <= aw.anr_ts + 1000000000 THEN 'dump_or_trigger'
+          ELSE 'post_anr'
+        END AS phase,
+        CASE
+          WHEN l.ts <= aw.anr_ts
+            AND (l.error_match = 1 OR l.component_match = 1 OR l.intent_match = 1)
+            AND (
+              l.global_signal_match = 1
+              OR (l.prio >= 5 AND l.signal_type <> 'other')
+            )
+            THEN 1
+          ELSE 0
+        END AS root_cause_eligible,
+        l.signal_type,
+        CASE
+          WHEN l.error_match = 1 OR l.component_match = 1 OR l.intent_match = 1 THEN 'event_scoped'
+          WHEN l.process_match = 1 THEN 'target_process_context'
+          ELSE 'global_context'
+        END AS evidence_scope,
+        CASE l.prio
+          WHEN 4 THEN 'INFO'
+          WHEN 5 THEN 'WARN'
+          WHEN 6 THEN 'ERROR'
+          WHEN 7 THEN 'FATAL'
+          ELSE CAST(l.prio AS TEXT)
+        END AS prio,
+        l.tag,
+        SUBSTR(l.msg, 1, 220) AS msg_preview
+      FROM scoped l
+      CROSS JOIN anr_window aw
+      WHERE l.ts >= aw.start_ts
+        AND l.ts <= aw.end_ts
+        AND l.prio >= 4
+        AND (
+          l.process_match = 1
+          OR l.component_match = 1
+          OR l.intent_match = 1
+          OR l.error_match = 1
+          OR (
+            l.ts <= aw.anr_ts
+            AND l.global_signal_match = 1
+          )
+        )
+      ORDER BY root_cause_eligible DESC, ABS(l.ts - aw.anr_ts), l.ts
+      LIMIT 40
+    save_as: logcat_event_context
+
+  # ============================================================================
+  # 诊断规则
+  # ============================================================================
+  - id: anr_event_diagnosis
+    type: diagnostic
+    name: "ANR 事件诊断"
+    display:
+      level: key
+      layer: deep
+      title: "诊断结果"
+    inputs: [anr_basic, quadrant, render_thread, lock_contention, app_freeze_check, wakeup, main_slices, direct_blocker_gap, direct_blocker_candidates, direct_blocker_slice_gap, direct_blocker_slice_candidates, logcat_context_gap, logcat_event_context]
+    rules:
+      # === 证据可用性 ===
+
+      - condition: "direct_blocker_gap.data?.find(r => r.direct_blocker_type === 'evidence_unavailable')"
+        severity: info
+        diagnosis: "当前 trace 缺少 thread_state，直接阻塞点不可判定"
+        confidence: low
+        suggestions:
+          - "不要仅凭 trigger 或 logcat 作为最终根因"
+          - "需要包含 thread_state 的 trace 才能判断主线程直接阻塞形态"
+
+      - condition: "direct_blocker_slice_gap.data?.find(r => r.direct_blocker_type === 'slice_evidence_unavailable')"
+        severity: info
+        diagnosis: "当前 trace 缺少 thread_track/slice，无法用 slice 判断 IO/GC/渲染候选"
+        confidence: low
+        suggestions:
+          - "thread_state 直接阻塞点仍可使用"
+          - "不要把缺失 slice 解释为没有 IO/GC/渲染等待"
+
+      - condition: "logcat_context_gap.data?.find(r => r.signal_type === 'evidence_unavailable')"
+        severity: info
+        diagnosis: "当前 trace 缺少 android_logs，无法用 Logcat/AnrManager 校验触发上下文"
+        confidence: low
+        suggestions:
+          - "保留该缺口，不要把缺失日志解释为没有系统/窗口/Binder 信号"
+          - "结合 Perfetto ANR 类型和线程状态继续分析"
+
+      # === 主线程状态诊断 ===
+
+      # 主线程长时间阻塞（Sleeping > 80%，必须有逐事件 direct_blocker 支撑）
+      - condition: "(quadrant.data[0]?.sleeping_pct || 0) > 80 && (direct_blocker_candidates.data?.find(r => ['binder_wait','lock_or_futex_wait','disk_or_page_fault_io','main_thread_sleep'].includes(r.direct_blocker_type) && r.confidence !== 'low') || direct_blocker_slice_candidates.data?.find(r => ['db_or_file_io_slice','render_or_fence_wait','gc_or_stw_wait'].includes(r.direct_blocker_type) && r.confidence !== 'low'))"
+        severity: warning
+        diagnosis: "主线程 Sleeping/Blocked 占比 ${quadrant.data[0].sleeping_pct}%，存在逐事件 direct_blocker 候选；仍需对应的对端/owner/系统上下文闭环"
+        confidence: medium
+        suggestions:
+          - "以 direct_blocker_classification 为准，不使用包名级 blocking 结果单独定因"
+          - "Binder wait 需要对端线程证据；锁等待需要 owner/monitor chain；IO/GC/Render 需要同窗口上下文"
+          - "nativePoll/epoll 等待不满足该规则，不能单独作为根因"
+
+      # 主线程 CPU 饥饿（Runnable > 30%，需逐事件 scheduler_pressure 候选）
+      - condition: "(quadrant.data[0]?.runnable_pct || 0) > 30 && direct_blocker_candidates.data?.find(r => r.direct_blocker_type === 'scheduler_pressure' && r.confidence !== 'low')"
+        severity: warning
+        diagnosis: "主线程等待调度 ${quadrant.data[0].runnable_pct}%，direct_blocker 标记 scheduler_pressure；需要系统负载/拓扑/调度证据闭环"
+        confidence: medium
+        suggestions:
+          - "主线程想运行但拿不到 CPU"
+          - "检查同一 ANR 窗口的 CPU health、Top CPU process 和调度延迟"
+          - "不要只凭包名级 sched_latency 结果定因"
+
+      # 主线程活跃但大核占比偏低（需调度佐证）
+      - condition: "quadrant.data[0]?.running_pct > 50 && quadrant.data[0]?.q1_big_running_ms < quadrant.data[0]?.q2_little_running_ms * 0.3 && quadrant.data[0]?.runnable_pct > 10 && direct_blocker_candidates.data?.find(r => r.direct_blocker_type === 'scheduler_pressure' && r.confidence !== 'low')"
+        severity: warning
+        diagnosis: "主线程大核占比偏低且存在调度等待（Runnable ${quadrant.data[0].runnable_pct}%），可能有 CPU 供给不足"
+        confidence: medium
+        suggestions:
+          - "检查高优先级线程是否占用大核"
+          - "检查是否有高优先级任务抢占大核"
+          - "可能触发温控策略"
+
+      # === Binder 阻塞诊断 ===
+
+      # Binder 直接阻塞候选（需要对端证据才可定责）
+      - condition: "direct_blocker_candidates.data?.find(r => r.direct_blocker_type === 'binder_wait')"
+        severity: warning
+        diagnosis: "主线程存在 Binder 等待候选，但该证据只能说明客户端等待，不能直接定责对端"
+        confidence: medium
+        suggestions:
+          - "补查 Binder 对端进程、server_dur 或 system_server 线程状态"
+          - "将 Binder wait 作为 direct blocker candidate，而不是最终根因"
+
+      # === 锁竞争诊断 ===
+
+      # Futex/锁等待候选（没有 owner 时降级）
+      - condition: "direct_blocker_candidates.data?.find(r => r.direct_blocker_type === 'lock_or_futex_wait') && !(lock_contention.data?.find(r => r.blocked_type === 'MainThread'))"
+        severity: warning
+        diagnosis: "主线程存在 futex/lock 等待候选，但缺少持锁线程/锁链证据"
+        confidence: medium
+        suggestions:
+          - "需要 android_monitor_contention、owner thread 或锁链证据确认"
+          - "不要把普通 futex_wait 直接写成死锁"
+
+      # 严重锁竞争（需主线程阻塞态佐证）
+      - condition: "direct_blocker_candidates.data?.find(r => r.direct_blocker_type === 'lock_or_futex_wait') && lock_contention.data?.find(r => r.blocked_type === 'MainThread' && r.severity === 'critical') && (quadrant.data[0]?.sleeping_pct || 0) > 50"
+        severity: critical
+        diagnosis: "主线程严重锁竞争：等待 ${lock_contention.data.find(r => r.blocked_type === 'MainThread' && r.severity === 'critical')?.blocking_thread_name} ${lock_contention.data.find(r => r.blocked_type === 'MainThread' && r.severity === 'critical')?.wait_ms}ms"
+        confidence: high
+        suggestions:
+          - "存在当前 ANR 进程主线程严重锁竞争"
+          - "持锁线程：${lock_contention.data.find(r => r.blocked_type === 'MainThread' && r.severity === 'critical')?.blocking_thread_name}"
+          - "阻塞方法：${lock_contention.data.find(r => r.blocked_type === 'MainThread' && r.severity === 'critical')?.blocking_method}"
+
+      # 主线程被锁阻塞（需阻塞态佐证）
+      - condition: "direct_blocker_candidates.data?.find(r => r.direct_blocker_type === 'lock_or_futex_wait') && lock_contention.data?.find(r => r.blocked_type === 'MainThread') && (quadrant.data[0]?.sleeping_pct || 0) > 30"
+        severity: warning
+        diagnosis: "主线程被锁阻塞"
+        confidence: high
+        suggestions:
+          - "主线程在等待获取锁"
+          - "避免主线程持有长时间锁"
+          - "考虑使用异步操作或减少锁粒度"
+
+      # === RenderThread 诊断 ===
+
+      # nativePoll/epoll 只作为降级证据
+      - condition: "direct_blocker_candidates.data?.find(r => r.direct_blocker_type === 'native_poll_idle_or_ambiguous') && !direct_blocker_candidates.data?.find(r => ['binder_wait','lock_or_futex_wait','disk_or_page_fault_io'].includes(r.direct_blocker_type)) && !direct_blocker_slice_candidates.data?.find(r => ['db_or_file_io_slice','render_or_fence_wait'].includes(r.direct_blocker_type))"
+        severity: info
+        diagnosis: "主线程主要表现为 native poll/epoll 等待；这是 idle-or-ambiguous 证据，不能单独作为 ANR 根因"
+        confidence: low
+        suggestions:
+          - "结合 EventLog/Logcat 的 input/no-focus/window 时间线判断真实触发链"
+          - "检查系统负载、焦点窗口、对端 Binder 或渲染链路是否是上游原因"
+
+      # nSyncDraw 阻塞（仅在主线程阻塞态明显时作为次要证据）
+      - condition: "render_thread.data?.find(r => r.name?.includes('nSyncDraw') && r.dur_ms > 50) && (quadrant.data[0]?.sleeping_pct || 0) > 30"
+        severity: warning
+        diagnosis: "RenderThread nSyncDraw 阻塞 ${render_thread.data.find(r => r.name?.includes('nSyncDraw'))?.dur_ms}ms"
+        confidence: high
+        suggestions:
+          - "渲染同步点阻塞"
+          - "可能与主线程有同步等待"
+          - "检查是否有复杂绘制操作"
+
+      # dequeueBuffer 阻塞（仅在主线程阻塞态明显时作为次要证据）
+      - condition: "render_thread.data?.find(r => r.name?.includes('dequeueBuffer') && r.dur_ms > 50) && (quadrant.data[0]?.sleeping_pct || 0) > 30"
+        severity: warning
+        diagnosis: "RenderThread dequeueBuffer 阻塞 ${render_thread.data.find(r => r.name?.includes('dequeueBuffer'))?.dur_ms}ms"
+        confidence: medium
+        suggestions:
+          - "等待 SurfaceFlinger 分配 Buffer"
+          - "可能是显示系统繁忙"
+          - "检查是否有大量图形渲染"
+
+      # === 应用冻结诊断 ===
+
+      # 应用完全冻结（MainThread、RenderThread、Binder 都冻结）
+      - condition: "app_freeze_check.data?.find(r => r.thread_type === 'MainThread')?.status === 'frozen' && app_freeze_check.data?.find(r => r.thread_type === 'RenderThread')?.status === 'frozen' && app_freeze_check.data?.find(r => r.thread_type === 'Binder')?.status === 'frozen' && (quadrant.data[0]?.sleeping_pct || 0) > 80"
+        severity: critical
+        diagnosis: "应用完全冻结，主线程活动率仅 ${app_freeze_check.data.find(r => r.thread_type === 'MainThread')?.activity_pct}%"
+        confidence: high
+        suggestions:
+          - "MainThread、RenderThread、Binder 均几乎没有活动"
+          - "可能是死锁或严重阻塞"
+          - "检查 direct_blocker、锁 owner、Binder 对端或系统上下文"
+
+      # 主线程冻结但其他线程未全部冻结
+      - condition: "app_freeze_check.data?.find(r => r.thread_type === 'MainThread')?.status === 'frozen' && (quadrant.data[0]?.sleeping_pct || 0) > 80 && !(app_freeze_check.data?.find(r => r.thread_type === 'RenderThread')?.status === 'frozen' && app_freeze_check.data?.find(r => r.thread_type === 'Binder')?.status === 'frozen')"
+        severity: warning
+        diagnosis: "主线程冻结/低活动，不能直接等同应用完全冻结"
+        confidence: medium
+        suggestions:
+          - "检查 RenderThread、Binder 线程是否仍活跃"
+          - "按 direct_blocker、锁 owner、Binder 对端或系统上下文继续定因"
+          - "只有 MainThread、RenderThread、Binder 均冻结时才报告应用完全冻结"
+
+output:
+  display:
+    level: key
+    format: summary
