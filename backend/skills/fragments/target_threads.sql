@@ -5,7 +5,8 @@
 -- Optional: ${main_start_ts}, ${main_end_ts}, ${render_start_ts}, ${render_end_ts}
 target_threads AS (
   SELECT t.utid, t.tid, t.name as thread_name, p.pid, p.name as process_name,
-    CASEnThread'
+    CASE
+      WHEN t.tid = p.pid THEN 'MainThread'
       WHEN t.name = 'RenderThread' THEN 'RenderThread'
       WHEN t.name GLOB '[0-9]*.raster' THEN 'RenderThread'
       WHEN t.name GLOB '[0-9]*.ui' THEN 'MainThread'
